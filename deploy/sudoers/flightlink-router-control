@@ -1,0 +1,2 @@
+# Install with visudo -cf before enabling. The helper validates every action and UUID.
+flightlink-api ALL=(root) NOPASSWD: /usr/local/sbin/flightlink-routerctl

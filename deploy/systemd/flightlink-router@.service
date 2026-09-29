@@ -1,0 +1,23 @@
+[Unit]
+Description=FlightLink MAVLink router channel %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mavlink-router
+Group=flightlink-router
+EnvironmentFile=/etc/flightlink/router.env
+ExecStart=/usr/bin/mavlink-routerd -c ${FLIGHTLINK_ROUTER_CONFIG_DIR}/channel-%i.conf
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flightlink-router-%i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

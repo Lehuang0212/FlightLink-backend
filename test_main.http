@@ -1,0 +1,78 @@
+# Manual admin API requests for the FastAPI service.
+# Sign in first, then copy the flightlink_session value from the Set-Cookie response header.
+# Copy the channel UUID from the create response before running get/update/delete.
+# Never save a real password or session token in a committed copy of this file.
+
+@host = http://127.0.0.1:8000
+@sessionToken = replace-with-flightlink_session-cookie-value
+@channelId = replace-with-created-channel-uuid
+
+### Public health check
+GET {{host}}/api/v1/health
+Accept: application/json
+
+### Admin login; copy flightlink_session from Set-Cookie into @sessionToken above
+POST {{host}}/api/v1/auth/login
+Accept: application/json
+Content-Type: application/json
+
+{
+  "username": "admin",
+  "password": "replace-with-your-password"
+}
+
+### Current admin session
+GET {{host}}/api/v1/auth/me
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+### Read-only Aliyun security-group preflight
+GET {{host}}/api/v1/integrations/aliyun/security-group/preflight
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+### Create the ECS acceptance channel (DTU UDP 5760 + QGC TCP 14552)
+POST {{host}}/api/v1/channels
+Accept: application/json
+Content-Type: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+{
+  "uav_udp_port": 5760,
+  "ground_station_port": 14552,
+  "ground_station_protocol": "tcp",
+  "enabled": true
+}
+
+### List configured channels
+GET {{host}}/api/v1/channels
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+### Inspect the created channel
+GET {{host}}/api/v1/channels/{{channelId}}
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+### Update to a second pair and switch QGC to UDP
+PUT {{host}}/api/v1/channels/{{channelId}}
+Accept: application/json
+Content-Type: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+{
+  "uav_udp_port": 5762,
+  "ground_station_port": 14554,
+  "ground_station_protocol": "udp",
+  "enabled": true
+}
+
+### Delete the test channel after real-device acceptance
+DELETE {{host}}/api/v1/channels/{{channelId}}
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}
+
+### Revoke the admin session
+POST {{host}}/api/v1/auth/logout
+Accept: application/json
+Cookie: flightlink_session={{sessionToken}}

@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Run constrained tcpdump processes for one FlightLink port channel."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+import selectors
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from uuid import UUID, uuid4
+
+
+CONFIG_DIR = Path(os.environ.get("FLIGHTLINK_CAPTURE_CONFIG_DIR", "/var/lib/flightlink/capture-configs"))
+CAPTURE_DIR = Path(os.environ.get("FLIGHTLINK_CAPTURE_DIR", "/var/lib/flightlink/captures"))
+TCPDUMP_PATH = os.environ.get("FLIGHTLINK_TCPDUMP_PATH", "/usr/sbin/tcpdump")
+PACKET_PREFIX = b"FLIGHTLINK_PACKET:"
+MAX_SUMMARY_LINE = 4096
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger("flightlink-capture-runner")
+STOP = threading.Event()
+
+
+def _stop(_signal: int, _frame: object) -> None:
+    STOP.set()
+
+
+def _read_config(channel_id: UUID) -> dict[str, int | str]:
+    path = CONFIG_DIR / f"channel-{channel_id}.json"
+    with path.open("r", encoding="utf-8") as stream:
+        config = json.load(stream)
+    if str(config.get("channel_id")) != str(channel_id):
+        raise ValueError("Capture config channel ID does not match the unit")
+    for key in ("uav_udp_port", "ground_station_port", "monitor_udp_port"):
+        value = config.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+            raise ValueError(f"Invalid capture config value: {key}")
+    rotate_seconds = config.get("rotate_seconds")
+    if (
+        isinstance(rotate_seconds, bool)
+        or not isinstance(rotate_seconds, int)
+        or not 1 <= rotate_seconds <= 86400
+    ):
+        raise ValueError("Invalid capture config value: rotate_seconds")
+    protocol = config.get("ground_station_protocol")
+    if protocol not in {"tcp", "udp"}:
+        raise ValueError("Invalid ground-station protocol in capture config")
+    return config
+
+
+def _filter(config: dict[str, int | str]) -> list[str]:
+    return [
+        "(", "udp", "port", str(config["uav_udp_port"]), ")",
+        "or",
+        "(", str(config["ground_station_protocol"]), "port",
+        str(config["ground_station_port"]), ")",
+    ]
+
+
+def _tcpdump_path() -> str:
+    if not Path(TCPDUMP_PATH).is_absolute():
+        raise ValueError("FLIGHTLINK_TCPDUMP_PATH must be an absolute path")
+    resolved = shutil.which(TCPDUMP_PATH)
+    if resolved is None:
+        raise FileNotFoundError(f"tcpdump executable was not found: {TCPDUMP_PATH}")
+    return resolved
+
+
+def _drain_stderr(stream: object, label: str) -> None:
+    if stream is None:
+        return
+    for raw_line in stream:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if line:
+            LOGGER.warning("tcpdump %s: %s", label, line[:500])
+
+
+def _start_capture_processes(
+    tcpdump: str,
+    channel_id: UUID,
+    config: dict[str, int | str],
+) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes], str]:
+    CAPTURE_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
+    os.umask(0o027)
+    expression = _filter(config)
+    base = [tcpdump, "-i", "any", "-nn"]
+    session_id = uuid4().hex[:8]
+    marker = CAPTURE_DIR / f"channel-{channel_id}.active"
+    temporary_marker = CAPTURE_DIR / f".{marker.name}.{session_id}.tmp"
+    temporary_marker.write_text(session_id + "\n", encoding="ascii")
+    temporary_marker.chmod(0o640)
+    os.replace(temporary_marker, marker)
+    pcap_pattern = CAPTURE_DIR / (
+        f"channel-{channel_id}-{session_id}-%Y%m%d-%H%M%S-%s.pcap"
+    )
+    pcap_command = [
+        *base,
+        "-s", "0",
+        "-U",
+        "-G", str(config["rotate_seconds"]),
+        "-w", str(pcap_pattern),
+        *expression,
+    ]
+    summary_command = [
+        *base,
+        "-s", "256",
+        "-tt",
+        "-v",
+        "-l",
+        *expression,
+    ]
+    pcap = subprocess.Popen(
+        pcap_command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        bufsize=0,
+    )
+    threading.Thread(
+        target=_drain_stderr,
+        args=(pcap.stderr, "pcap"),
+        name="tcpdump-pcap-stderr",
+        daemon=True,
+    ).start()
+    summary = subprocess.Popen(
+        summary_command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        bufsize=0,
+    )
+    threading.Thread(
+        target=_drain_stderr,
+        args=(summary.stderr, "summary"),
+        name="tcpdump-summary-stderr",
+        daemon=True,
+    ).start()
+    LOGGER.info("Capture started for channel %s", channel_id)
+    return pcap, summary, session_id
+
+
+def _terminate(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+def _run(channel_id: UUID) -> int:
+    config = _read_config(channel_id)
+    tcpdump = _tcpdump_path()
+    monitor_port = int(config["monitor_udp_port"])
+    marker = CAPTURE_DIR / f"channel-{channel_id}.active"
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    selector = selectors.DefaultSelector()
+    line_buffer = bytearray()
+    pcap: subprocess.Popen[bytes] | None = None
+    summary: subprocess.Popen[bytes] | None = None
+    registered_stream: object | None = None
+    restart_after = 0.0
+    active_session_id: str | None = None
+    last_marker_refresh = time.monotonic()
+
+    try:
+        CAPTURE_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
+        pcap, summary, active_session_id = _start_capture_processes(
+            tcpdump, channel_id, config
+        )
+        assert summary.stdout is not None
+        registered_stream = summary.stdout
+        os.set_blocking(summary.stdout.fileno(), False)
+        selector.register(summary.stdout, selectors.EVENT_READ)
+        while not STOP.is_set():
+            if pcap.poll() is not None or summary.poll() is not None:
+                if registered_stream is not None:
+                    try:
+                        selector.unregister(registered_stream)
+                    except (KeyError, ValueError):
+                        pass
+                _terminate(pcap)
+                _terminate(summary)
+                if time.monotonic() < restart_after:
+                    STOP.wait(0.5)
+                    continue
+                LOGGER.warning("Restarting exited tcpdump process for %s", channel_id)
+                pcap, summary, active_session_id = _start_capture_processes(
+                    tcpdump, channel_id, config
+                )
+                last_marker_refresh = time.monotonic()
+                assert summary.stdout is not None
+                registered_stream = summary.stdout
+                os.set_blocking(summary.stdout.fileno(), False)
+                selector.register(summary.stdout, selectors.EVENT_READ)
+                line_buffer.clear()
+                restart_after = time.monotonic() + 2.0
+                continue
+
+            for key, _ in selector.select(timeout=0.5):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    continue
+                line_buffer.extend(chunk)
+                while b"\n" in line_buffer:
+                    raw_line, _, remainder = line_buffer.partition(b"\n")
+                    line_buffer = bytearray(remainder)
+                    if not raw_line:
+                        continue
+                    summary_line = raw_line[:MAX_SUMMARY_LINE].strip()
+                    try:
+                        sender.sendto(PACKET_PREFIX + summary_line, ("127.0.0.1", monitor_port))
+                    except OSError:
+                        pass
+                if len(line_buffer) > MAX_SUMMARY_LINE:
+                    line_buffer.clear()
+            if time.monotonic() - last_marker_refresh >= 10.0:
+                try:
+                    os.utime(marker, None)
+                except OSError:
+                    pass
+                last_marker_refresh = time.monotonic()
+        return 0
+    finally:
+        try:
+            selector.close()
+        finally:
+            _terminate(summary)
+            _terminate(pcap)
+            sender.close()
+            try:
+                if active_session_id and marker.read_text(encoding="ascii").strip() == active_session_id:
+                    marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+        LOGGER.info("Capture stopped for channel %s", channel_id)
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 1:
+        print("Usage: flightlink-capture-runner CHANNEL_UUID", file=sys.stderr)
+        return 2
+    try:
+        channel_id = UUID(arguments[0])
+    except ValueError:
+        print("Invalid channel UUID", file=sys.stderr)
+        return 2
+    if str(channel_id) != arguments[0].lower():
+        print("Invalid channel UUID", file=sys.stderr)
+        return 2
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        return _run(channel_id)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        LOGGER.error("Unable to start capture for %s: %s", channel_id, exc)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

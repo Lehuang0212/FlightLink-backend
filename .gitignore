@@ -1,0 +1,37 @@
+.venv/
+.venv-*/
+.idea/
+.superpowers/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environment files; keep the safe template visible to Git.
+.env
+.env.*
+!.env.example
+
+# Runtime state and captures.
+data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.pcap
+*.pcapng
+*.log
+logs/
+
+# Build, test, coverage, and tool caches.
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/

@@ -1,0 +1,29 @@
+[Unit]
+Description=FlightLink-Console FastAPI service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flightlink-api
+Group=flightlink-api
+SupplementaryGroups=flightlink-router flightlink-capture
+WorkingDirectory=/opt/flightlink/backend
+EnvironmentFile=/etc/flightlink/api.env
+ExecStart=/opt/flightlink/backend/.venv/bin/uvicorn flightlink_backend.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flightlink-api
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/flightlink
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

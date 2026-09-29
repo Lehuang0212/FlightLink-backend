@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Narrow root helper for managing FlightLink's templated router units."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from uuid import UUID
+
+
+SYSTEMCTL = "/usr/bin/systemctl"
+JOURNALCTL = "/usr/bin/journalctl"
+UNIT_PREFIX = "flightlink-router@"
+CAPTURE_UNIT_PREFIX = "flightlink-capture@"
+UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def fail(message: str, exit_code: int = 2) -> int:
+    print(message, file=sys.stderr)
+    return exit_code
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) not in {2, 3}:
+        return fail("Usage: flightlink-routerctl ACTION UUID [LOG_LIMIT]")
+
+    action, raw_channel_id = arguments[:2]
+    try:
+        channel_id = str(UUID(raw_channel_id))
+    except ValueError:
+        return fail("Invalid channel UUID")
+    if channel_id != raw_channel_id.lower() or not UUID_PATTERN.fullmatch(channel_id):
+        return fail("Invalid channel UUID")
+
+    if action.startswith("capture-"):
+        action = action.removeprefix("capture-")
+        unit_prefix = CAPTURE_UNIT_PREFIX
+    else:
+        unit_prefix = UNIT_PREFIX
+    unit = f"{unit_prefix}{channel_id}.service"
+    if action in {"start", "stop", "restart"} and len(arguments) == 2:
+        command = [SYSTEMCTL, action, unit]
+    elif action == "status" and len(arguments) == 2:
+        command = [
+            SYSTEMCTL,
+            "show",
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=MainPID",
+            "--property=ActiveEnterTimestamp",
+            "--property=Result",
+            unit,
+        ]
+    elif action == "logs" and len(arguments) == 3:
+        try:
+            limit = int(arguments[2])
+        except ValueError:
+            return fail("Log limit must be an integer")
+        if not 1 <= limit <= 500:
+            return fail("Log limit must be between 1 and 500")
+        command = [
+            JOURNALCTL,
+            "--unit",
+            unit,
+            "--no-pager",
+            "--lines",
+            str(limit),
+            "--output=short-iso",
+        ]
+    else:
+        return fail("Unsupported action or invalid argument count")
+
+    try:
+        result = subprocess.run(command, check=False, text=True, capture_output=True)
+    except OSError as exc:
+        return fail(f"Unable to execute system service command: {exc}", 1)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

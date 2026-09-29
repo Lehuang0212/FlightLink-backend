@@ -1,0 +1,31 @@
+[Unit]
+Description=FlightLink packet capture channel %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flightlink-capture
+Group=flightlink-capture
+EnvironmentFile=/etc/flightlink/capture.env
+Environment=TZ=UTC
+ExecStart=/usr/bin/python3 /usr/local/sbin/flightlink-capture-runner %i
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flightlink-capture-%i
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/flightlink/capture-configs
+ReadWritePaths=/var/lib/flightlink/captures
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+
+[Install]
+WantedBy=multi-user.target
