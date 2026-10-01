@@ -31,6 +31,7 @@ from ..services.channel_security_group import (
     delete_managed_channel,
     update_managed_channel,
 )
+from ..services.channel_operations import channel_operation_lock
 from ..services.router_manager import (
     RouterManagerError,
     get_router_manager,
@@ -79,7 +80,15 @@ def read_channels(
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> list[ChannelPublic]:
-    return [_with_runtime(channel) for channel in list_channels(connection)]
+    channels: list[ChannelPublic] = []
+    for listed_channel in list_channels(connection):
+        with channel_operation_lock(listed_channel.id):
+            try:
+                current_channel = get_channel(connection, listed_channel.id)
+            except ChannelNotFound:
+                continue
+            channels.append(_with_runtime(current_channel))
+    return channels
 
 
 @router.post("", response_model=ChannelPublic, status_code=status.HTTP_201_CREATED)
@@ -105,10 +114,11 @@ def read_channel(
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> ChannelPublic:
-    try:
-        return _with_runtime(get_channel(connection, channel_id))
-    except ChannelNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
+    with channel_operation_lock(channel_id):
+        try:
+            return _with_runtime(get_channel(connection, channel_id))
+        except ChannelNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
 
 
 @router.put("/{channel_id}", response_model=ChannelPublic)
@@ -118,22 +128,23 @@ def replace_channel(
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> ChannelPublic:
-    try:
-        return update_managed_channel(connection, channel_id, payload)
-    except ChannelNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
-    except ChannelConflict as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except ChannelConfigFailure as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Router config generation failed; channel changes were rolled back",
-        ) from exc
-    except ChannelSecurityGroupFailure as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+    with channel_operation_lock(channel_id):
+        try:
+            return update_managed_channel(connection, channel_id, payload)
+        except ChannelNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
+        except ChannelConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ChannelConfigFailure as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Router config generation failed; channel changes were rolled back",
+            ) from exc
+        except ChannelSecurityGroupFailure as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
 
 
 @router.delete("/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -142,35 +153,36 @@ def remove_channel(
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> Response:
-    try:
-        delete_managed_channel(connection, channel_id)
-    except ChannelNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
-    except ChannelConfigFailure as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Router config removal failed; channel changes were rolled back",
-        ) from exc
-    except CaptureFileError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Packet capture config could not be removed: {exc}",
-        ) from exc
-    except RouterManagerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Router service could not be stopped; channel was not deleted: {exc}",
-        ) from exc
-    except CaptureManagerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Packet capture service could not be stopped; channel was not deleted: {exc}",
-        ) from exc
-    except ChannelSecurityGroupFailure as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+    with channel_operation_lock(channel_id):
+        try:
+            delete_managed_channel(connection, channel_id)
+        except ChannelNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
+        except ChannelConfigFailure as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Router config removal failed; channel changes were rolled back",
+            ) from exc
+        except CaptureFileError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Packet capture config could not be removed: {exc}",
+            ) from exc
+        except RouterManagerError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Router service could not be stopped; channel was not deleted: {exc}",
+            ) from exc
+        except CaptureManagerError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Packet capture service could not be stopped; channel was not deleted: {exc}",
+            ) from exc
+        except ChannelSecurityGroupFailure as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -180,23 +192,24 @@ def restart_channel(
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
 ) -> ChannelPublic:
-    try:
-        channel = get_channel(connection, channel_id)
-    except ChannelNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
-    if not channel.enabled:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Disabled channels cannot be restarted",
-        )
-    try:
-        runtime = restart_router_service(channel_id)
-    except RouterManagerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Router service restart failed: {exc}",
-        ) from exc
-    return _with_runtime(channel.model_copy(update={"runtime": runtime}))
+    with channel_operation_lock(channel_id):
+        try:
+            channel = get_channel(connection, channel_id)
+        except ChannelNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
+        if not channel.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Disabled channels cannot be restarted",
+            )
+        try:
+            runtime = restart_router_service(channel_id)
+        except RouterManagerError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Router service restart failed: {exc}",
+            ) from exc
+        return _with_runtime(channel.model_copy(update={"runtime": runtime}))
 
 
 @router.get("/{channel_id}/logs")

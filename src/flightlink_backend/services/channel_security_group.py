@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sqlite3
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from ..schemas.channels import ChannelPublic, ChannelWrite
 from .capture_files import remove_capture_config
 from .capture_manager import stop_capture_service
 from .channel_runtime import reconcile_channel_runtime, runtime_matches_channel
+from .channel_operations import channel_operation_lock
 from .channels import (
     create_channel,
     delete_channel,
@@ -107,15 +108,26 @@ def create_managed_channel(
     payload: ChannelWrite,
 ) -> ChannelPublic:
     """Create local state, sync ingress, then start runtime only when safe."""
-    channel = create_channel(connection, payload)
-    result = ensure_channel_rules(connection, channel.id, payload)
-    channel = get_channel(connection, channel.id)
-    if result.state not in {"synced", "disabled"}:
-        return channel
-    return reconcile_channel_runtime(channel)
+    channel_id = uuid4()
+    with channel_operation_lock(channel_id):
+        channel = create_channel(connection, payload, channel_id=channel_id)
+        result = ensure_channel_rules(connection, channel.id, payload)
+        channel = get_channel(connection, channel.id)
+        if result.state not in {"synced", "disabled"}:
+            return channel
+        return reconcile_channel_runtime(channel)
 
 
 def update_managed_channel(
+    connection: sqlite3.Connection,
+    channel_id: UUID,
+    payload: ChannelWrite,
+) -> ChannelPublic:
+    with channel_operation_lock(channel_id):
+        return _update_managed_channel_locked(connection, channel_id, payload)
+
+
+def _update_managed_channel_locked(
     connection: sqlite3.Connection,
     channel_id: UUID,
     payload: ChannelWrite,
@@ -218,6 +230,14 @@ def update_managed_channel(
 
 
 def delete_managed_channel(
+    connection: sqlite3.Connection,
+    channel_id: UUID,
+) -> None:
+    with channel_operation_lock(channel_id):
+        _delete_managed_channel_locked(connection, channel_id)
+
+
+def _delete_managed_channel_locked(
     connection: sqlite3.Connection,
     channel_id: UUID,
 ) -> None:

@@ -326,14 +326,48 @@ class _ChannelState:
             self.packets_lost_weighted *= 0.8
             self.last_counter_decay = now
 
+    def _reset_vehicle_session(self) -> None:
+        """Discard telemetry and link statistics belonging to the previous UAV."""
+        self.primary_system_id = None
+        self.primary_component_id = None
+        self.vehicle_type = None
+        self.autopilot_id = None
+        self.flight_mode = None
+        self.armed = None
+        self.battery_remaining_percent = None
+        self.battery_voltage_v = None
+        self.gps_fix_type = None
+        self.gps_satellites = None
+        self.altitude_m = None
+        self.relative_altitude_m = None
+        self.ground_speed_m_s = None
+        self.radio_status = None
+        self.last_packet_monotonic = None
+        self.last_packet_at = None
+        self.uav_peer = None
+        self.last_heartbeat_monotonic = None
+        self.last_sequence = None
+        self.packets_received_weighted = 0.0
+        self.packets_lost_weighted = 0.0
+        self.link_quality_percent = None
+        self.last_counter_decay = time.monotonic()
+        self.last_quality_decay = self.last_counter_decay
+        self.uav_bytes.clear()
+        self.messages.clear()
+
     def _record_vehicle_packet(self, sequence: int, frame_bytes: int, now: float) -> None:
         self._decay_packet_counters(now)
-        if self.last_sequence is not None:
-            gap = (sequence - self.last_sequence) & 0xFF
-            if gap > 1:
-                self.packets_lost_weighted += gap - 1
-        self.packets_received_weighted += 1
-        self.last_sequence = sequence
+        if self.last_sequence is None:
+            self.packets_received_weighted += 1
+            self.last_sequence = sequence
+        else:
+            delta = (sequence - self.last_sequence) & 0xFF
+            # A modulo delta in the forward half-range is a new packet (including wrap).
+            # The other half-range is ambiguous and treated as late/reordered traffic.
+            if 0 < delta < 128:
+                self.packets_lost_weighted += delta - 1
+                self.packets_received_weighted += 1
+                self.last_sequence = sequence
         denominator = self.packets_received_weighted + self.packets_lost_weighted
         if denominator > 0:
             self.link_quality_percent = 100.0 * self.packets_received_weighted / denominator
@@ -379,7 +413,13 @@ class _ChannelState:
                         self.gcs_bytes.popleft()
                     return
                 if autopilot != 0 and source_component == 1:
-                    if self.primary_system_id is None:
+                    heartbeat_expired = (
+                        self.last_heartbeat_monotonic is not None
+                        and now - self.last_heartbeat_monotonic > UAV_HEARTBEAT_TIMEOUT_SECONDS
+                    )
+                    if self.primary_system_id is None or heartbeat_expired:
+                        if self.primary_system_id is not None:
+                            self._reset_vehicle_session()
                         self.primary_system_id = source_system
                         self.primary_component_id = source_component
                     if (

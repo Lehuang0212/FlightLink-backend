@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly APP_DIR="/opt/flightlink/backend"
+readonly DATA_DEFAULT="/var/lib/flightlink"
+readonly CONFIG_DIR="/etc/flightlink"
+readonly ROUTER_SOURCE="/usr/local/src/mavlink-router"
+readonly API_UNIT="flightlink-api.service"
+DISTRO=""
+
+log() { printf '[FlightLink] %s\n' "$*"; }
+warn() { printf '[FlightLink] 警告：%s\n' "$*" >&2; }
+fail() { printf '[FlightLink] 错误：%s\n' "$*" >&2; exit 1; }
+
+on_error() {
+    local status=$?
+    printf '[FlightLink] 错误：第 %s 行命令执行失败（退出码 %s）。\n' "$1" "$status" >&2
+    exit "$status"
+}
+trap 'on_error "$LINENO"' ERR
+
+require_root() {
+    [[ "$EUID" -eq 0 ]] || fail "请使用 sudo 运行：sudo bash deploy/flightlink-run"
+}
+
+require_checkout() {
+    local script_dir repo_root
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    repo_root="$(cd -- "$script_dir/.." && pwd -P)"
+    [[ "$repo_root" == "$APP_DIR" ]] || fail "请先将后端仓库克隆到 $APP_DIR，再从该目录运行本脚本。"
+    [[ -f "$APP_DIR/pyproject.toml" && -f "$APP_DIR/uv.lock" ]] || fail "在 $APP_DIR 中未找到后端项目文件。"
+    cd "$APP_DIR"
+}
+
+require_supported_host() {
+    [[ -r /etc/os-release ]] || fail "无法识别当前 Linux 发行版。"
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    case "${ID:-}:${VERSION_ID:-}" in
+        ubuntu:24.04*) DISTRO=ubuntu ;;
+        rocky:9*) DISTRO=rocky ;;
+        *) fail "当前仅支持 Ubuntu 24.04 和 Rocky Linux 9；检测到：${PRETTY_NAME:-未知系统}。" ;;
+    esac
+    [[ -d /run/systemd/system ]] || fail "本脚本需要运行在使用 systemd 的 ECS 主机上。"
+}
+
+install_os_packages() {
+    local needs_packages=0 command_name
+    for command_name in python3.12 tcpdump curl git sudo visudo; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            needs_packages=1
+        fi
+    done
+    if [[ ! -x /usr/bin/mavlink-routerd ]] && ! command -v mavlink-routerd >/dev/null 2>&1; then
+        needs_packages=1
+    fi
+    if [[ "$needs_packages" -eq 0 ]]; then
+        log "系统依赖已齐全。"
+        return
+    fi
+
+    log "正在为 $DISTRO 安装 Python、抓包工具和编译依赖……"
+    if [[ "$DISTRO" == ubuntu ]]; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            python3.12 python3.12-venv python3-pip \
+            tcpdump curl ca-certificates git sudo \
+            meson ninja-build pkg-config gcc g++ libsystemd-dev
+    else
+        dnf install -y \
+            python3.12 python3.12-pip \
+            tcpdump curl ca-certificates git sudo \
+            meson ninja-build pkgconf-pkg-config gcc gcc-c++ systemd-devel
+    fi
+    command -v python3.12 >/dev/null 2>&1 || fail "Python 3.12 未能安装，请检查系统软件源。"
+    command -v tcpdump >/dev/null 2>&1 || fail "tcpdump 未能安装。"
+    command -v visudo >/dev/null 2>&1 || fail "缺少 visudo，请安装 sudo 软件包后重新运行。"
+}
+
+install_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        log "uv 已安装：$(command -v uv)。"
+        return
+    fi
+    log "正在安装 uv 到 /usr/local/bin……"
+    local installer
+    installer="$(mktemp)"
+    curl --fail --location --silent --show-error --retry 3 \
+        https://astral.sh/uv/install.sh --output "$installer"
+    UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh "$installer"
+    rm -f -- "$installer"
+    command -v uv >/dev/null 2>&1 || [[ -x /usr/local/bin/uv ]] || fail "uv 安装后未找到可执行程序。"
+    export PATH="/usr/local/bin:$PATH"
+}
+
+install_mavlink_router() {
+    if [[ -x /usr/bin/mavlink-routerd ]]; then
+        log "mavlink-routerd 已安装：/usr/bin/mavlink-routerd。"
+        return
+    fi
+
+    local existing_router
+    existing_router="$(command -v mavlink-routerd || true)"
+    if [[ -n "$existing_router" ]]; then
+        log "使用已安装的 mavlink-routerd：$existing_router。"
+        ln -s -- "$existing_router" /usr/bin/mavlink-routerd
+        return
+    fi
+
+    log "正在从上游源码编译 mavlink-router……"
+    install -d -o root -g root -m 0755 /usr/local/src
+    if [[ ! -d "$ROUTER_SOURCE/.git" ]]; then
+        [[ ! -e "$ROUTER_SOURCE" ]] || fail "$ROUTER_SOURCE 已存在但不是 Git 仓库，请先移走该目录后重试。"
+        git clone --recursive https://github.com/mavlink-router/mavlink-router.git "$ROUTER_SOURCE"
+    else
+        git -C "$ROUTER_SOURCE" submodule update --init --recursive
+    fi
+
+    if [[ -f "$ROUTER_SOURCE/build/build.ninja" ]]; then
+        meson setup --reconfigure "$ROUTER_SOURCE/build" "$ROUTER_SOURCE" --prefix=/usr
+    else
+        meson setup "$ROUTER_SOURCE/build" "$ROUTER_SOURCE" --prefix=/usr
+    fi
+    ninja -C "$ROUTER_SOURCE/build"
+    ninja -C "$ROUTER_SOURCE/build" install
+    [[ -x /usr/bin/mavlink-routerd ]] || fail "mavlink-router 编译完成，但未生成 /usr/bin/mavlink-routerd。"
+}
+
+ensure_group() {
+    local group=$1
+    getent group "$group" >/dev/null || groupadd --system "$group"
+}
+
+ensure_user() {
+    local user=$1 group=$2 home=$3
+    local nologin=/usr/sbin/nologin
+    [[ -x "$nologin" ]] || nologin=/sbin/nologin
+    if getent passwd "$user" >/dev/null; then
+        [[ "$(id -gn "$user")" == "$group" ]] || fail "现有系统账号 $user 的主组不是预期的 $group，请修正后重新运行。"
+        return
+    fi
+    useradd --system --gid "$group" --home-dir "$home" --no-create-home --shell "$nologin" "$user"
+}
+
+read_env_value() {
+    local file=$1 key=$2 fallback=${3:-} line value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$key="* ]] || continue
+        value=${line#*=}
+        value=${value%$'\r'}
+        if [[ "$value" == \"*\" ]]; then value=${value#\"}; value=${value%\"}; fi
+        if [[ "$value" == \'*\' ]]; then value=${value#\'}; value=${value%\'}; fi
+        printf '%s' "$value"
+        return 0
+    done < "$file"
+    printf '%s' "$fallback"
+}
+
+validate_cidr_list() {
+    python3.12 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    networks = [ipaddress.ip_network(value.strip(), strict=False) for value in sys.argv[1].split(",")]
+except ValueError as exc:
+    raise SystemExit(f"CIDR 网段格式无效：{exc}")
+if not networks or any(network.version != 4 for network in networks):
+    raise SystemExit("仅支持以逗号分隔的 IPv4 CIDR 网段。")
+PY
+}
+
+write_api_environment() {
+    [[ -e "$CONFIG_DIR/api.env" ]] && return
+
+    local temp_file
+    temp_file="$(mktemp "$CONFIG_DIR/api.env.XXXXXX")"
+    {
+        cat <<'EOF'
+# 由 FlightLink 部署脚本管理；请勿放在 Git 仓库中。
+FLIGHTLINK_DATA_DIR=/var/lib/flightlink
+FLIGHTLINK_DATABASE_PATH=/var/lib/flightlink/flightlink.sqlite3
+FLIGHTLINK_ROUTER_CONFIG_DIR=/var/lib/flightlink/router-configs
+FLIGHTLINK_CAPTURE_CONFIG_DIR=/var/lib/flightlink/capture-configs
+FLIGHTLINK_CAPTURE_DIR=/var/lib/flightlink/captures
+FLIGHTLINK_ROUTER_MANAGER=systemd
+FLIGHTLINK_ROUTER_CONTROL_HELPER=/usr/local/sbin/flightlink-routerctl
+FLIGHTLINK_SUDO_PATH=/usr/bin/sudo
+FLIGHTLINK_ROUTER_COMMAND_TIMEOUT_SECONDS=10
+FLIGHTLINK_PCAP_ROTATE_SECONDS=600
+FLIGHTLINK_PCAP_RETENTION_SECONDS=86400
+FLIGHTLINK_PCAP_MAX_BYTES=1073741824
+FLIGHTLINK_PCAP_CLEANUP_INTERVAL_SECONDS=300
+FLIGHTLINK_SESSION_COOKIE_NAME=flightlink_session
+FLIGHTLINK_SESSION_TTL_SECONDS=43200
+FLIGHTLINK_SESSION_COOKIE_SECURE=false
+EOF
+        printf 'FLIGHTLINK_SECURITY_GROUP_PROVIDER=disabled\n'
+        printf 'FLIGHTLINK_ALIYUN_API_TIMEOUT_SECONDS=10\n'
+    } > "$temp_file"
+    chown root:root "$temp_file"
+    chmod 0600 "$temp_file"
+    mv -- "$temp_file" "$CONFIG_DIR/api.env"
+    log "已创建 $CONFIG_DIR/api.env；已有配置不会被覆盖。"
+}
+
+update_api_environment() {
+    local env_file=$1
+    shift
+    python3.12 - "$env_file" "$@" <<'PY'
+import os
+import sys
+import tempfile
+
+path, *updates = sys.argv[1:]
+values = dict(item.split("=", 1) for item in updates)
+lines = []
+seen = set()
+with open(path, encoding="utf-8") as source:
+    for line in source:
+        if not line.endswith("\n"):
+            line += "\n"
+        key = line.split("=", 1)[0]
+        if key in values:
+            if key not in seen:
+                lines.append(f"{key}={values[key]}\n")
+                seen.add(key)
+            continue
+        lines.append(line)
+for key, value in values.items():
+    if key not in seen:
+        lines.append(f"{key}={value}\n")
+
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix="api.env.", dir=directory, text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        target.writelines(lines)
+        target.flush()
+        os.fsync(target.fileno())
+    os.chmod(temporary, 0o600)
+    os.chown(temporary, 0, 0)
+    os.replace(temporary, path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+ensure_environment_files() {
+    install -d -o root -g root -m 0750 "$CONFIG_DIR"
+    write_api_environment
+    if [[ ! -e "$CONFIG_DIR/router.env" ]]; then
+        cat > "$CONFIG_DIR/router.env" <<'EOF'
+FLIGHTLINK_ROUTER_CONFIG_DIR=/var/lib/flightlink/router-configs
+EOF
+    fi
+    if [[ ! -e "$CONFIG_DIR/capture.env" ]]; then
+        local tcpdump_path
+        tcpdump_path="$(command -v tcpdump)"
+        cat > "$CONFIG_DIR/capture.env" <<EOF
+FLIGHTLINK_CAPTURE_CONFIG_DIR=/var/lib/flightlink/capture-configs
+FLIGHTLINK_CAPTURE_DIR=/var/lib/flightlink/captures
+FLIGHTLINK_TCPDUMP_PATH=$tcpdump_path
+EOF
+    fi
+    chown root:root "$CONFIG_DIR/api.env" "$CONFIG_DIR/router.env" "$CONFIG_DIR/capture.env"
+    chmod 0600 "$CONFIG_DIR/api.env" "$CONFIG_DIR/router.env" "$CONFIG_DIR/capture.env"
+}
+
+setup_runtime_directories() {
+    local data_dir database_path router_dir capture_config_dir capture_dir router_env_dir capture_env_config capture_env_dir
+    data_dir="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_DATA_DIR "$DATA_DEFAULT")"
+    database_path="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_DATABASE_PATH "$data_dir/flightlink.sqlite3")"
+    router_dir="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ROUTER_CONFIG_DIR "$data_dir/router-configs")"
+    capture_config_dir="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_CAPTURE_CONFIG_DIR "$data_dir/capture-configs")"
+    capture_dir="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_CAPTURE_DIR "$data_dir/captures")"
+    router_env_dir="$(read_env_value "$CONFIG_DIR/router.env" FLIGHTLINK_ROUTER_CONFIG_DIR '')"
+    capture_env_config="$(read_env_value "$CONFIG_DIR/capture.env" FLIGHTLINK_CAPTURE_CONFIG_DIR '')"
+    capture_env_dir="$(read_env_value "$CONFIG_DIR/capture.env" FLIGHTLINK_CAPTURE_DIR '')"
+
+    [[ "$data_dir" == /* && "$database_path" == /* && "$router_dir" == /* && "$capture_config_dir" == /* && "$capture_dir" == /* ]] || fail "环境文件中的运行目录必须使用绝对路径。"
+    [[ "$router_dir" == "$router_env_dir" ]] || fail "api.env 和 router.env 中的 FLIGHTLINK_ROUTER_CONFIG_DIR 必须一致。"
+    [[ "$capture_config_dir" == "$capture_env_config" && "$capture_dir" == "$capture_env_dir" ]] || fail "api.env 和 capture.env 中的抓包目录配置必须一致。"
+    [[ "$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ROUTER_MANAGER systemd)" == systemd ]] || fail "ECS 部署必须将 FLIGHTLINK_ROUTER_MANAGER 设置为 systemd。"
+
+    install -d -o flightlink-api -g flightlink-api -m 0711 "$data_dir"
+    install -d -o flightlink-api -g flightlink-router -m 2750 "$router_dir"
+    install -d -o flightlink-api -g flightlink-capture -m 2750 "$capture_config_dir"
+    install -d -o flightlink-capture -g flightlink-capture -m 2770 "$capture_dir"
+    chmod 2770 "$capture_dir"
+    local database_dir
+    database_dir="$(dirname -- "$database_path")"
+    if [[ "$database_dir" != "$data_dir" ]]; then
+        install -d -o flightlink-api -g flightlink-api -m 0700 "$database_dir"
+    fi
+
+    if [[ -e "$database_path" ]]; then
+        chown flightlink-api:flightlink-api "$database_path"
+        chmod 0600 "$database_path"
+    fi
+    for suffix in -wal -shm; do
+        if [[ -e "$database_path$suffix" ]]; then
+            chown flightlink-api:flightlink-api "$database_path$suffix"
+            chmod 0600 "$database_path$suffix"
+        fi
+    done
+}
+
+cloud_settings_complete() {
+    local provider region security_group uav_cidrs gcs_cidrs
+    provider="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_SECURITY_GROUP_PROVIDER disabled)"
+    [[ "$provider" == aliyun ]] || return 1
+    region="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_REGION_ID '')"
+    security_group="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID '')"
+    uav_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_UAV_SOURCE_CIDRS '')"
+    gcs_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_GCS_SOURCE_CIDRS '')"
+    [[ "$region" =~ ^[A-Za-z0-9-]+$ && "$security_group" =~ ^[A-Za-z0-9-]+$ ]] || return 1
+    [[ -n "$uav_cidrs" && -n "$gcs_cidrs" && "$gcs_cidrs" != *replace-with* ]] || return 1
+    validate_cidr_list "$uav_cidrs" >/dev/null 2>&1 || return 1
+    validate_cidr_list "$gcs_cidrs" >/dev/null 2>&1 || return 1
+}
+
+validate_cloud_settings() {
+    local region security_group uav_cidrs gcs_cidrs
+    region="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_REGION_ID '')"
+    security_group="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID '')"
+    uav_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_UAV_SOURCE_CIDRS '')"
+    gcs_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_GCS_SOURCE_CIDRS '')"
+    [[ "$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_SECURITY_GROUP_PROVIDER '')" == aliyun ]] || fail "阿里云安全组集成未启用。"
+    [[ "$region" =~ ^[A-Za-z0-9-]+$ ]] || fail "$CONFIG_DIR/api.env 中的阿里云地域 ID 无效。"
+    [[ "$security_group" =~ ^[A-Za-z0-9-]+$ ]] || fail "$CONFIG_DIR/api.env 中的安全组 ID 无效。"
+    validate_cidr_list "$uav_cidrs" || fail "$CONFIG_DIR/api.env 中的 DTU 来源网段无效。"
+    [[ -n "$gcs_cidrs" && "$gcs_cidrs" != *replace-with* ]] || fail "$CONFIG_DIR/api.env 中尚未填写 QGC 来源网段。"
+    validate_cidr_list "$gcs_cidrs" || fail "$CONFIG_DIR/api.env 中的 QGC 来源网段无效。"
+}
+
+prompt_cloud_settings() {
+    local region security_group uav_cidrs gcs_cidrs role_name answer
+    if ! cloud_settings_complete; then
+        [[ -t 0 ]] || fail "阿里云安全组参数尚未配置完整，需要打开交互式终端后运行 sudo bash deploy/flightlink-run。"
+        printf '\n阿里云安全组参数尚未配置完整。请按提示补齐；参数和管理员账号准备完成后才会启动后端。\n'
+        printf '请先在阿里云控制台为这台 ECS 绑定 RAM 角色，并为角色授予 README 中说明的安全组权限。无需输入长期 AccessKey。\n'
+
+        region="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_REGION_ID '')"
+        read -r -p "安全组所在地域 ID（例如 cn-hangzhou）${region:+ [$region]}：" answer || fail "读取终端输入失败。"
+        region=${answer:-$region}
+        [[ "$region" =~ ^[A-Za-z0-9-]+$ ]] || fail "地域 ID 格式无效，请重新运行并输入有效的地域 ID。"
+
+        security_group="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID '')"
+        read -r -p "目标安全组 ID（例如 sg-...）${security_group:+ [$security_group]}：" answer || fail "读取终端输入失败。"
+        security_group=${answer:-$security_group}
+        [[ "$security_group" =~ ^[A-Za-z0-9-]+$ ]] || fail "安全组 ID 格式无效，请重新运行并输入有效的安全组 ID。"
+
+        uav_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_UAV_SOURCE_CIDRS '')"
+        read -r -p "DTU 来源 IPv4 网段，可用逗号分隔；留空默认 0.0.0.0/0（允许任意来源）${uav_cidrs:+ [$uav_cidrs]}：" answer || fail "读取终端输入失败。"
+        uav_cidrs=${answer:-${uav_cidrs:-0.0.0.0/0}}
+        validate_cidr_list "$uav_cidrs" || fail "DTU 来源网段格式无效，请重新运行并输入 IPv4 CIDR，例如 203.0.113.10/32。"
+
+        gcs_cidrs="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_GCS_SOURCE_CIDRS '')"
+        read -r -p "QGC 来源 IPv4 网段，可用逗号分隔${gcs_cidrs:+ [$gcs_cidrs]}：" answer || fail "读取终端输入失败。"
+        gcs_cidrs=${answer:-$gcs_cidrs}
+        [[ -n "$gcs_cidrs" && "$gcs_cidrs" != *replace-with* ]] || fail "必须填写实际的 QGC 来源网段，例如 203.0.113.10/32。"
+        validate_cidr_list "$gcs_cidrs" || fail "QGC 来源网段格式无效，请重新运行并输入 IPv4 CIDR。"
+
+        role_name="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_ALIYUN_ECS_ROLE_NAME '')"
+        read -r -p "可选：ECS RAM 角色名称；留空由 SDK 自动发现${role_name:+ [$role_name]}：" answer || fail "读取终端输入失败。"
+        role_name=${answer:-$role_name}
+        [[ -z "$role_name" || "$role_name" =~ ^[A-Za-z0-9+=,.@_-]+$ ]] || fail "RAM 角色名称格式无效。"
+
+        update_api_environment "$CONFIG_DIR/api.env" \
+            "FLIGHTLINK_ALIYUN_REGION_ID=$region" \
+            "FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID=$security_group" \
+            "FLIGHTLINK_ALIYUN_UAV_SOURCE_CIDRS=$uav_cidrs" \
+            "FLIGHTLINK_ALIYUN_GCS_SOURCE_CIDRS=$gcs_cidrs" \
+            "FLIGHTLINK_ALIYUN_ECS_ROLE_NAME=$role_name" \
+            "FLIGHTLINK_SECURITY_GROUP_PROVIDER=aliyun"
+        log "阿里云安全组参数已写入 $CONFIG_DIR/api.env。"
+    else
+        log "阿里云安全组参数已配置。"
+    fi
+    validate_cloud_settings
+}
+
+create_admin_if_needed() {
+    local data_dir database_path count
+    umask 0077
+    data_dir="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_DATA_DIR "$DATA_DEFAULT")"
+    database_path="$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_DATABASE_PATH "$data_dir/flightlink.sqlite3")"
+    count="$(sudo -u flightlink-api -- env \
+        FLIGHTLINK_DATA_DIR="$data_dir" \
+        FLIGHTLINK_DATABASE_PATH="$database_path" \
+        "$APP_DIR/.venv/bin/python" -c '
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+table = connection.execute("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?", ("table", "admin_users")).fetchone()
+print(connection.execute("SELECT COUNT(*) FROM admin_users").fetchone()[0] if table else 0)
+' "$database_path")"
+    if [[ "$count" != 0 ]]; then
+        log "已存在管理员账号，保留现有账号。"
+        return
+    fi
+    if [[ -t 0 ]]; then
+        log "尚无管理员账号，请创建第一个管理员。输入密码时终端不会显示密码。"
+        sudo -u flightlink-api -- env \
+            FLIGHTLINK_DATA_DIR="$data_dir" \
+            FLIGHTLINK_DATABASE_PATH="$database_path" \
+            "$APP_DIR/.venv/bin/ConsoleUseradd"
+    else
+        fail "尚无管理员账号，无法启动服务。请在交互式终端运行：sudo -u flightlink-api env FLIGHTLINK_DATA_DIR='$data_dir' FLIGHTLINK_DATABASE_PATH='$database_path' $APP_DIR/.venv/bin/ConsoleUseradd；创建账号后重新运行本脚本。"
+    fi
+}
+
+install_service_files() {
+    install -o root -g root -m 0644 deploy/systemd/flightlink-router@.service /etc/systemd/system/flightlink-router@.service
+    install -o root -g root -m 0644 deploy/systemd/flightlink-capture@.service /etc/systemd/system/flightlink-capture@.service
+    install -o root -g root -m 0644 deploy/systemd/flightlink-api.service /etc/systemd/system/flightlink-api.service
+    install -o root -g root -m 0755 deploy/sbin/flightlink-routerctl /usr/local/sbin/flightlink-routerctl
+    install -o root -g root -m 0755 deploy/sbin/flightlink-capture-runner /usr/local/sbin/flightlink-capture-runner
+    visudo -cf deploy/sudoers/flightlink-router-control
+    install -o root -g root -m 0440 deploy/sudoers/flightlink-router-control /etc/sudoers.d/flightlink-router-control
+    visudo -cf /etc/sudoers.d/flightlink-router-control
+    systemctl daemon-reload
+}
+
+start_api() {
+    systemctl enable "$API_UNIT"
+    if systemctl is-active --quiet "$API_UNIT"; then
+        systemctl restart "$API_UNIT"
+    else
+        systemctl start "$API_UNIT"
+    fi
+
+    local attempt
+    for attempt in {1..30}; do
+        if curl --fail --silent http://127.0.0.1:8000/api/v1/health >/dev/null; then
+            log "后端健康检查通过：http://127.0.0.1:8000/api/v1/health。"
+            return
+        fi
+        sleep 1
+    done
+    systemctl --no-pager --full status "$API_UNIT" || true
+    journalctl --unit "$API_UNIT" --lines 60 --no-pager || true
+    fail "后端健康检查未通过，请查看上方服务日志。"
+}
+
+main() {
+    log "正在检查运行权限、后端目录和 ECS 系统版本……"
+    require_root
+    require_checkout
+    require_supported_host
+    export PATH="/usr/local/bin:$PATH"
+
+    log "正在检查并补齐 ECS 系统运行环境……"
+    install_os_packages
+    install_uv
+    install_mavlink_router
+
+    ensure_group flightlink-api
+    ensure_group flightlink-router
+    ensure_group flightlink-capture
+    ensure_user flightlink-api flightlink-api /var/lib/flightlink
+    ensure_user mavlink-router flightlink-router /nonexistent
+    ensure_user flightlink-capture flightlink-capture /nonexistent
+
+    log "正在准备服务账号、环境文件和数据目录……"
+    ensure_environment_files
+    setup_runtime_directories
+
+    log "正在检查并补齐后端 Python 运行依赖……"
+    uv sync --frozen --no-dev --python 3.12
+    [[ -x "$APP_DIR/.venv/bin/uvicorn" && -x "$APP_DIR/.venv/bin/ConsoleUseradd" ]] || fail "Python 依赖安装后仍缺少后端启动或账号管理程序。"
+
+    log "正在检查阿里云安全组参数……"
+    prompt_cloud_settings
+    create_admin_if_needed
+    install_service_files
+    log "安全组参数和管理员账号均已就绪，正在启动 systemd 后端服务……"
+    start_api
+
+    log "部署完成。常用管理命令："
+    printf '  sudo systemctl status %s\n' "$API_UNIT"
+    printf '  sudo systemctl restart %s\n' "$API_UNIT"
+    printf '  sudo journalctl -u %s -f\n' "$API_UNIT"
+    log "后端仅监听 127.0.0.1:8000；不要在阿里云安全组中向公网开放 TCP 8000。"
+    log "前端和 Nginx 反向代理需要单独部署。"
+    if [[ "$(read_env_value "$CONFIG_DIR/api.env" FLIGHTLINK_SESSION_COOKIE_SECURE false)" == false ]]; then
+        log "若之后通过 HTTPS 提供管理页面，请将 FLIGHTLINK_SESSION_COOKIE_SECURE 设置为 true 并重启后端。"
+    fi
+}
+
+main "$@"

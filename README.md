@@ -79,7 +79,7 @@ TCP 地面站在线状态和对端地址通过 Linux 的 /proc/net/tcp* 连接�
 
 使用本项目提供的 SSH 本地转发、通过 `http://127.0.0.1:8000` 管理时，示例环境文件将安全 Cookie 关闭；这是本机回环访问场景。通过 HTTPS 提供管理界面时应启用 `FLIGHTLINK_SESSION_COOKIE_SECURE=true`。运行 API 和 `ConsoleUseradd` 时须使用相同的数据库环境设置。
 
-生产部署要求 FastAPI、systemd、mavlink-routerd 和 tcpdump 位于同一 ECS 主机上；当前没有实现容器到宿主机的控制桥接。按下方“Ubuntu / Rocky 原生 systemd 部署”步骤创建专用服务账号和目录，并安装本项目提供的 router、capture 与 API systemd 单元。API 数据目录归 API 账号所有；路由配置目录允许 API 写入并允许 mavlink-router 组读取；抓包配置和 PCAP 目录由 API 与专用抓包组按只读/读写职责共享。
+生产部署要求 FastAPI、systemd、mavlink-routerd 和 tcpdump 位于同一 ECS 主机上；当前没有实现容器到宿主机的控制桥接。按下方“一键部署”步骤创建专用服务账号和目录，并安装本项目提供的 router、capture 与 API systemd 单元。API 数据目录归 API 账号所有；路由配置目录允许 API 写入并允许 mavlink-router 组读取；抓包配置和 PCAP 目录由 API 与专用抓包组按只读/读写职责共享。
 
 助手只允许 API 账号执行固定的路由/抓包服务启停、状态和路由日志操作；助手必须归 root 所有，且不能由 API 账号写入。API 服务应在 network-online.target 后启动，启动协调会恢复已启用但未运行的路由和抓包单元。主机防火墙不会由本服务修改。阿里云安全组可按下方“阿里云安全组配置”单独启用后由后端管理。
 
@@ -165,36 +165,9 @@ DTU 来源可以是 `0.0.0.0/0`，但每架通道只开放其配置的一个 UDP
 
 ### Ubuntu / Rocky 依赖
 
-安装 Python 3.12+、curl、Git、Meson、Ninja 与 tcpdump；请保留系统自带 Python，不要替换系统解释器。Ubuntu 24.04 可使用系统软件源安装 Python 3.12。Rocky Linux 9 的启用软件源需提供 Python 3.12；如果默认软件源没有该版本，请先使用组织批准且受维护的软件源。安装后用 `python3.12 --version` 确认：
+`deploy/flightlink-run` 会检查并补齐 Python 3.12、uv、tcpdump、systemd 构建依赖，并在主机尚未安装时从上游源码构建 `mavlink-routerd`。支持 Ubuntu 24.04 和 Rocky Linux 9；ECS 需要能访问软件源、Astral uv 安装源和 GitHub。若 ECS 尚未安装 Git，先按系统安装：Ubuntu 使用 `sudo apt-get update && sudo apt-get install -y git`，Rocky 使用 `sudo dnf install -y git`。
 
-```bash
-# Ubuntu 24.04 LTS
-sudo apt-get update
-sudo apt-get install -y python3.12 python3.12-venv python3-pip tcpdump curl ca-certificates git meson ninja-build pkg-config gcc g++ libsystemd-dev
-
-# Rocky Linux 9（需启用提供 Python 3.12 的系统软件源）
-sudo dnf install -y python3.12 python3.12-pip tcpdump curl ca-certificates git meson ninja-build pkgconf-pkg-config gcc gcc-c++ systemd-devel
-```
-
-安装 `uv` 到 `/usr/local/bin`：
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
-uv --version
-```
-
-`mavlink-routerd` 可按上游项目说明从源码构建。以下命令使用默认 `/usr/local` 前缀；本项目的 router unit 默认执行 `/usr/bin/mavlink-routerd`，所以若 `command -v mavlink-routerd` 显示其他路径，请在安装 unit 前修改其 `ExecStart`：
-
-```bash
-sudo git clone --recursive https://github.com/mavlink-router/mavlink-router.git /usr/local/src/mavlink-router
-sudo meson setup /usr/local/src/mavlink-router/build /usr/local/src/mavlink-router
-sudo ninja -C /usr/local/src/mavlink-router/build
-sudo ninja -C /usr/local/src/mavlink-router/build install
-command -v mavlink-routerd
-command -v tcpdump
-```
-
-`uv` 的官方安装说明和 MAVLink Router 上游构建说明见 [uv installation](https://docs.astral.sh/uv/getting-started/installation/) 与 [mavlink-router README](https://github.com/mavlink-router/mavlink-router/blob/master/README.md)。这些步骤不更改主机防火墙。
+先在阿里云控制台给 ECS 绑定具备本项目所需权限的实例 RAM 角色。安装脚本不会配置主机防火墙或前端 Nginx，也不会把 AccessKey 写入主机。
 
 ### ECS、DTU 与 QGC 实际验收
 
@@ -206,80 +179,42 @@ command -v tcpdump
 4. 如需验证更新流程，可改用另一对端口（例如 UDP `5761` / TCP `14553`，或明确选择 QGC UDP），确认新规则先出现、服务切换成功后旧的后端托管规则才清理，并重新连接验证。
 5. 删除测试通道，确认服务先停止，且只删除 FlightLink 记录的测试规则；确认共享/手工规则仍保留。
 
-阿里云角色、地域、安全组 ID 和来源 CIDR 的真实值由部署者写入 ECS 服务环境文件；不要把凭证或带真实会话 Cookie 的 `.http` 文件提交到代码库。云端实际连通验收应在上述配置完成后进行。
+部署者通过启动脚本输入阿里云地域、安全组 ID 和来源 CIDR；脚本会将参数写入 ECS 的 `/etc/flightlink/api.env`。RAM 角色仍需先在阿里云控制台绑定。不要把凭证或带真实会话 Cookie 的 `.http` 文件提交到代码库。云端实际连通验收应在上述配置完成后进行。
 
-### Ubuntu / Rocky 原生 systemd 部署
+### Ubuntu / Rocky 原生 systemd 一键部署
 
-本项目在 ECS 上以原生 systemd 服务运行。先将你自己的 GitHub 仓库地址替换到下方命令；克隆后在项目根目录同步锁定依赖：
+在 ECS 上克隆后端仓库到固定目录，再运行安装脚本。脚本会先安装和检查运行依赖，再检查阿里云安全组参数；参数缺失时会用中文终端提示补齐地域、安全组 ID、DTU 来源 CIDR 和 QGC 来源 CIDR。DTU 来源网段留空默认 `0.0.0.0/0`，这表示允许任意来源，建议填写具体公网 IP 的 `/32` 网段。RAM 角色名可留空由 SDK 自动发现，**不要输入长期 AccessKey**。运行前先在阿里云控制台将 RAM 角色绑定到这台 ECS 并授予所需权限。若尚无管理员账号，脚本会用中文提示创建用户名和密码；两项配置完成后才启动后端。
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/flightlink
-sudo git clone <your-repository-url> /opt/flightlink/backend
+sudo git clone https://github.com/Lehuang0212/FlightLink-backend.git /opt/flightlink/backend
 cd /opt/flightlink/backend
-sudo uv sync --frozen --no-dev --python 3.12
+sudo bash deploy/flightlink-run
 ```
 
-创建 API、router 和 capture 服务账号及共享目录。父目录只允许遍历，router/capture 子目录再通过专用组授予最小读写权限：
+脚本会安装并同步依赖，创建专用账号与数据目录，生成权限受限的环境文件，安装 systemd 单元和受限服务助手，并启用 API 开机启动。已存在的环境文件和 SQLite/抓包数据会保留。成功后可用以下命令查看和管理 API：
 
 ```bash
-sudo groupadd --system flightlink-api
-sudo useradd --system --gid flightlink-api --home-dir /var/lib/flightlink --no-create-home --shell /usr/sbin/nologin flightlink-api
-sudo groupadd --system flightlink-router
-sudo useradd --system --gid flightlink-router --no-create-home --shell /usr/sbin/nologin mavlink-router
-sudo groupadd --system flightlink-capture
-sudo useradd --system --gid flightlink-capture --no-create-home --shell /usr/sbin/nologin flightlink-capture
-sudo install -d -o flightlink-api -g flightlink-api -m 0711 /var/lib/flightlink
-sudo install -d -o flightlink-api -g flightlink-router -m 2750 /var/lib/flightlink/router-configs
-sudo install -d -o flightlink-api -g flightlink-capture -m 2750 /var/lib/flightlink/capture-configs
-sudo install -d -o flightlink-capture -g flightlink-capture -m 2750 /var/lib/flightlink/captures
-sudo install -d -o root -g root -m 0755 /etc/flightlink
+sudo systemctl status flightlink-api.service
+sudo systemctl restart flightlink-api.service
+sudo journalctl -u flightlink-api.service -f
 ```
 
-复制示例环境文件到仓库外，并用 `sudoedit` 将地域、安全组 ID 和 QGC 的公网出口 CIDR 替换为实际值。保留 ECS 实例 RAM 角色认证，不要加入 AccessKey：
-
-```bash
-sudo install -o root -g root -m 0600 .env.example /etc/flightlink/api.env
-sudoedit /etc/flightlink/api.env
-sudoedit /etc/flightlink/router.env
-sudoedit /etc/flightlink/capture.env
-```
-
-`/etc/flightlink/router.env` 至少设置 `FLIGHTLINK_ROUTER_CONFIG_DIR=/var/lib/flightlink/router-configs`。`/etc/flightlink/capture.env` 至少设置 `FLIGHTLINK_CAPTURE_CONFIG_DIR=/var/lib/flightlink/capture-configs`、`FLIGHTLINK_CAPTURE_DIR=/var/lib/flightlink/captures` 和 `FLIGHTLINK_TCPDUMP_PATH`（使用 `command -v tcpdump` 查到的路径）。`/etc/flightlink/api.env` 的数据库和目录值应与这几个配置相符；通过 SSH 本地转发使用 HTTP 时保留 `FLIGHTLINK_SESSION_COOKIE_SECURE=false`，改由 HTTPS 提供管理界面时再设为 `true`。
-
-安装模板、root 所有的受限助手、sudoers 规则和 API unit。先检查 sudoers 语法，再重新加载 systemd：
-
-```bash
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-router@.service /etc/systemd/system/flightlink-router@.service
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-capture@.service /etc/systemd/system/flightlink-capture@.service
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-api.service /etc/systemd/system/flightlink-api.service
-sudo install -o root -g root -m 0755 deploy/sbin/flightlink-routerctl /usr/local/sbin/flightlink-routerctl
-sudo install -o root -g root -m 0755 deploy/sbin/flightlink-capture-runner /usr/local/sbin/flightlink-capture-runner
-sudo visudo -cf deploy/sudoers/flightlink-router-control
-sudo install -o root -g root -m 0440 deploy/sudoers/flightlink-router-control /etc/sudoers.d/flightlink-router-control
-sudo visudo -cf /etc/sudoers.d/flightlink-router-control
-sudo systemctl daemon-reload
-```
-
-创建管理员时要使用 API 相同的数据库路径。密码只在交互提示中输入，不会回显：
+后续仍可使用原有的 `ConsoleUseradd` 命令添加管理员；在 ECS 上运行：
 
 ```bash
 sudo -u flightlink-api env FLIGHTLINK_DATA_DIR=/var/lib/flightlink FLIGHTLINK_DATABASE_PATH=/var/lib/flightlink/flightlink.sqlite3 /opt/flightlink/backend/.venv/bin/ConsoleUseradd
 ```
 
-启动 API，并启用开机启动：
-
-```bash
-sudo systemctl enable --now flightlink-api.service
-sudo systemctl status flightlink-api.service
-```
-
-API 仅监听 `127.0.0.1:8000`。管理员电脑通过 SSH 隧道连接，不要在阿里云安全组开放 TCP `8000`：
+后端只监听 ECS 本机 `127.0.0.1:8000`，不要在阿里云安全组开放 TCP `8000`。临时管理可通过 SSH 本地转发访问 API：
 
 ```bash
 ssh -N -L 8000:127.0.0.1:8000 <ecs-user>@<ecs-public-ip>
 ```
 
-保持隧道终端运行，在本机打开 `http://127.0.0.1:8000/docs`。登录后先完成只读安全组预检，再创建 DTU UDP `5760` / QGC TCP `14552` 通道。将 DTU 配置为向 ECS 公网地址的 UDP `5760` 发送 MAVLink，将 QGC 配置为通过 TCP `14552` 连接；然后查看通道遥测、`packets` 实时摘要、`messages` 飞控 STATUSTEXT 和 `logs` 中的 mavlink-router journal。首次实测由你在 ECS、DTU 和 QGC 上执行；看到结果并确认前不要删除测试通道。
+当前脚本只安装后端。前端构建和 Nginx 反向代理需要单独部署；生产代理应将 `/api/` 转发到 `127.0.0.1:8000`，并通过 HTTPS 提供网页。HTTPS 部署时将 `/etc/flightlink/api.env` 中的 `FLIGHTLINK_SESSION_COOKIE_SECURE` 改为 `true` 后重启 API。
+
+发布后端更新时，在仓库目录执行 `sudo git pull --ff-only`，然后再次运行 `sudo bash deploy/flightlink-run`；脚本会同步依赖、重新加载服务配置并重启 API，不会改动 `/var/lib/flightlink` 数据。
 
 ---
 
@@ -452,36 +387,9 @@ After admin login, call `GET /api/v1/integrations/aliyun/security-group/prefligh
 
 ### Ubuntu and Rocky Linux dependencies
 
-Install Python 3.12 or newer, curl, Git, Meson, Ninja, and tcpdump. Keep the operating system's default Python intact. Ubuntu 24.04 provides Python 3.12 in its system repositories. On Rocky Linux 9, use a supported repository that provides Python 3.12; if the configured repositories do not provide it, use an organization-approved maintained source. Verify with `python3.12 --version`:
+`deploy/flightlink-run` checks and installs Python 3.12, uv, tcpdump, systemd build dependencies, and builds upstream `mavlink-routerd` if it is not already installed. It supports Ubuntu 24.04 and Rocky Linux 9. The ECS needs access to the OS package repositories, Astral's uv installer, and GitHub. If Git is missing, install it first (`sudo apt-get update && sudo apt-get install -y git` on Ubuntu; `sudo dnf install -y git` on Rocky).
 
-```bash
-# Ubuntu 24.04 LTS
-sudo apt-get update
-sudo apt-get install -y python3.12 python3.12-venv python3-pip tcpdump curl ca-certificates git meson ninja-build pkg-config gcc g++ libsystemd-dev
-
-# Rocky Linux 9 (enable a system repository that provides Python 3.12)
-sudo dnf install -y python3.12 python3.12-pip tcpdump curl ca-certificates git meson ninja-build pkgconf-pkg-config gcc gcc-c++ systemd-devel
-```
-
-Install `uv` into `/usr/local/bin`:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
-uv --version
-```
-
-Build `mavlink-routerd` from its upstream source instructions. The commands below use the default `/usr/local` prefix. The supplied router unit defaults to `/usr/bin/mavlink-routerd`; if `command -v mavlink-routerd` returns a different path, edit the unit's `ExecStart` before installing it:
-
-```bash
-sudo git clone --recursive https://github.com/mavlink-router/mavlink-router.git /usr/local/src/mavlink-router
-sudo meson setup /usr/local/src/mavlink-router/build /usr/local/src/mavlink-router
-sudo ninja -C /usr/local/src/mavlink-router/build
-sudo ninja -C /usr/local/src/mavlink-router/build install
-command -v mavlink-routerd
-command -v tcpdump
-```
-
-See the official [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/) and [MAVLink Router build instructions](https://github.com/mavlink-router/mavlink-router/blob/master/README.md). These steps do not change the host firewall.
+Attach an ECS instance RAM role with this project's required permissions in the Alibaba Cloud console before installation. The script does not configure the host firewall or front-end Nginx, and it never asks for or stores an AccessKey.
 
 ### ECS, DTU, and QGC acceptance checklist
 
@@ -493,83 +401,41 @@ Local automated tests use fake cloud providers and temporary SQLite databases. T
 4. To verify the update flow, change the channel to another pair, such as UDP `5761` / TCP `14553` (or explicitly choose QGC UDP). Confirm replacement rules are added first, old FlightLink-owned rules are removed only after the service switches successfully, and both clients reconnect.
 5. Delete the test channel. Confirm services stop first and only FlightLink-owned test rules are removed; shared or manually created rules must remain.
 
-The deployer supplies the real RAM role, region, security-group ID, and source CIDRs in the ECS service environment file. Do not commit credentials or an `.http` file containing a real session cookie. Real cloud and hardware acceptance takes place only after that configuration is complete.
+The deployer enters the Alibaba Cloud region, security-group ID, and source CIDRs in the installer; it writes them to `/etc/flightlink/api.env`. Attach the RAM role in the Alibaba Cloud console first. Do not commit credentials or an `.http` file containing a real session cookie. Real cloud and hardware acceptance takes place only after that configuration is complete.
 
-### ECS systemd setup
+### One-command native systemd setup on Ubuntu / Rocky
 
-FastAPI, systemd, mavlink-routerd, and tcpdump run on the same ECS host. FastAPI runs as the non-root flightlink-api service and controls the per-channel router and capture units through the fixed root-owned helper. This deployment does not run systemd in a container. For local Windows development, set FLIGHTLINK_ROUTER_MANAGER=disabled.
-
-Clone the repository you uploaded to GitHub into the stable install path, replacing the URL with your repository address. Then install the locked Python dependencies:
+Clone the backend repository to the fixed path on the ECS and run the installer. It checks and installs the runtime dependencies first. When Alibaba Cloud security-group settings are incomplete, it prompts in Chinese for the region, security-group ID, UAV source CIDR, and QGC source CIDR. Leaving the UAV source range blank defaults to `0.0.0.0/0`, which allows any source; use a specific public IP `/32` when possible. Leave the optional RAM role name blank for SDK discovery. **Do not enter a long-lived AccessKey.** Attach the RAM role to the ECS and grant it the required permissions in the Alibaba Cloud console before running the script. If no administrator exists, the script also prompts in Chinese for the first username and password. The API starts only after both the cloud settings and an administrator are ready.
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/flightlink
-sudo git clone <your-repository-url> /opt/flightlink/backend
+sudo git clone https://github.com/Lehuang0212/FlightLink-backend.git /opt/flightlink/backend
 cd /opt/flightlink/backend
-sudo uv sync --frozen --no-dev --python 3.12
+sudo bash deploy/flightlink-run
 ```
 
-Create service accounts and groups, then create the shared runtime directories. The parent directory permits traversal only; router and capture permissions are granted on their group-owned subdirectories:
+The script installs and syncs dependencies, creates dedicated service accounts and data directories, writes protected environment files, installs the systemd units and restricted service helper, and enables API startup at boot. Existing environment files and SQLite/capture data are preserved. Manage the API with:
 
 ```bash
-sudo groupadd --system flightlink-api
-sudo useradd --system --gid flightlink-api --home-dir /var/lib/flightlink --no-create-home --shell /usr/sbin/nologin flightlink-api
-sudo groupadd --system flightlink-router
-sudo useradd --system --gid flightlink-router --no-create-home --shell /usr/sbin/nologin mavlink-router
-sudo groupadd --system flightlink-capture
-sudo useradd --system --gid flightlink-capture --no-create-home --shell /usr/sbin/nologin flightlink-capture
-sudo install -d -o flightlink-api -g flightlink-api -m 0711 /var/lib/flightlink
-sudo install -d -o flightlink-api -g flightlink-router -m 2750 /var/lib/flightlink/router-configs
-sudo install -d -o flightlink-api -g flightlink-capture -m 2750 /var/lib/flightlink/capture-configs
-sudo install -d -o flightlink-capture -g flightlink-capture -m 2750 /var/lib/flightlink/captures
-sudo install -d -o root -g root -m 0755 /etc/flightlink
+sudo systemctl status flightlink-api.service
+sudo systemctl restart flightlink-api.service
+sudo journalctl -u flightlink-api.service -f
 ```
 
-Copy the placeholder-only API environment example outside the checkout. Edit it with the actual region, security-group ID, and QGC public egress CIDR. Keep instance RAM-role credentials; do not add an AccessKey:
-
-```bash
-sudo install -o root -g root -m 0600 .env.example /etc/flightlink/api.env
-sudoedit /etc/flightlink/api.env
-sudoedit /etc/flightlink/router.env
-sudoedit /etc/flightlink/capture.env
-```
-
-In router.env, set FLIGHTLINK_ROUTER_CONFIG_DIR=/var/lib/flightlink/router-configs. In capture.env, set FLIGHTLINK_CAPTURE_CONFIG_DIR=/var/lib/flightlink/capture-configs, FLIGHTLINK_CAPTURE_DIR=/var/lib/flightlink/captures, and FLIGHTLINK_TCPDUMP_PATH to the path from command -v tcpdump. Keep the API environment paths consistent. The sample disables Secure cookies for the SSH-forwarded HTTP connection; use true when serving the admin interface through HTTPS.
-
-Install the template units, root-owned helpers, sudoers rule, and API unit. Validate sudoers syntax before enabling it:
-
-```bash
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-router@.service /etc/systemd/system/flightlink-router@.service
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-capture@.service /etc/systemd/system/flightlink-capture@.service
-sudo install -o root -g root -m 0644 deploy/systemd/flightlink-api.service /etc/systemd/system/flightlink-api.service
-sudo install -o root -g root -m 0755 deploy/sbin/flightlink-routerctl /usr/local/sbin/flightlink-routerctl
-sudo install -o root -g root -m 0755 deploy/sbin/flightlink-capture-runner /usr/local/sbin/flightlink-capture-runner
-sudo visudo -cf deploy/sudoers/flightlink-router-control
-sudo install -o root -g root -m 0440 deploy/sudoers/flightlink-router-control /etc/sudoers.d/flightlink-router-control
-sudo visudo -cf /etc/sudoers.d/flightlink-router-control
-sudo systemctl daemon-reload
-```
-
-The API service unit supplies the flightlink-router and flightlink-capture supplementary groups. It must not use NoNewPrivileges=true because its restricted sudo call needs the setuid sudo executable to invoke the helper. The helper is root-owned and permits only fixed router/capture service operations. The capture unit runs as flightlink-capture with CAP_NET_RAW; the API and helper do not run as root.
-
-Create the administrator using the same database path as the API. The password is entered interactively without echo:
+The existing `ConsoleUseradd` command remains available for adding administrators later:
 
 ```bash
 sudo -u flightlink-api env FLIGHTLINK_DATA_DIR=/var/lib/flightlink FLIGHTLINK_DATABASE_PATH=/var/lib/flightlink/flightlink.sqlite3 /opt/flightlink/backend/.venv/bin/ConsoleUseradd
 ```
 
-Enable and start the API:
-
-```bash
-sudo systemctl enable --now flightlink-api.service
-sudo systemctl status flightlink-api.service
-```
-
-The API listens only on 127.0.0.1:8000. Reach it through an SSH tunnel from the administrator computer; do not open TCP 8000 in the Alibaba Cloud security group:
+The backend listens only on the ECS loopback address `127.0.0.1:8000`. Do not open TCP `8000` in the Alibaba Cloud security group. For temporary administration, create an SSH local-forward:
 
 ```bash
 ssh -N -L 8000:127.0.0.1:8000 <ecs-user>@<ecs-public-ip>
 ```
 
-Keep the tunnel open and visit http://127.0.0.1:8000/docs locally. Sign in and run the read-only security-group preflight. Then create one enabled channel with DTU UDP 5760 and QGC TCP 14552. Point the DTU at the ECS public address on UDP 5760 and connect QGC to the same address over TCP 14552. Inspect channel telemetry, /packets for live packet summaries, /messages for flight-controller STATUSTEXT, and /logs for the per-channel mavlink-router journal. Complete the real acceptance on the ECS with the DTU and QGC, and leave the channel available until its results have been reviewed.
+This script installs the backend only. Build and deploy the front end and its Nginx reverse proxy separately; in production Nginx should forward `/api/` to `127.0.0.1:8000` and serve the web UI over HTTPS. For HTTPS, set `FLIGHTLINK_SESSION_COOKIE_SECURE=true` in `/etc/flightlink/api.env` and restart the API.
+
+To deploy a backend update, run `sudo git pull --ff-only` in the repository, then run `sudo bash deploy/flightlink-run` again. The script syncs dependencies, reloads service configuration, and restarts the API without changing `/var/lib/flightlink` data.
 
 There is no public registration endpoint. Administrator accounts are created only through ConsoleUseradd.

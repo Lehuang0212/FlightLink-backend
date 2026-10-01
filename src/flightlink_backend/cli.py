@@ -15,32 +15,32 @@ MAX_PASSWORD_LENGTH = 1024
 
 
 def add_admin() -> int:
-    """Create an administrator interactively; never accept a password as an argument."""
+    """通过终端交互创建管理员；密码不会通过命令行参数传入。"""
     try:
-        username = input("Administrator username: ").strip()
+        username = input("管理员用户名：").strip()
     except (EOFError, KeyboardInterrupt):
-        print("Cancelled.", file=sys.stderr)
+        print("已取消创建。", file=sys.stderr)
         return 1
 
     if not USERNAME_PATTERN.fullmatch(username):
-        print("Username must be 3-64 characters: letters, numbers, dot, underscore or hyphen.", file=sys.stderr)
+        print("用户名须为 3–64 个字符，只能使用英文字母、数字、点、下划线或连字符。", file=sys.stderr)
         return 2
 
     try:
-        password = getpass.getpass("Password (at least 8 characters): ")
-        confirmation = getpass.getpass("Confirm password: ")
+        password = getpass.getpass("密码（至少 8 个字符）：")
+        confirmation = getpass.getpass("确认密码：")
     except (EOFError, KeyboardInterrupt):
-        print("Cancelled.", file=sys.stderr)
+        print("已取消创建。", file=sys.stderr)
         return 1
 
     if len(password) < MIN_PASSWORD_LENGTH:
-        print("Password must contain at least 8 characters.", file=sys.stderr)
+        print("密码至少需要 8 个字符。", file=sys.stderr)
         return 2
     if len(password) > MAX_PASSWORD_LENGTH:
-        print("Password must contain no more than 1024 characters.", file=sys.stderr)
+        print("密码不能超过 1024 个字符。", file=sys.stderr)
         return 2
     if password != confirmation:
-        print("Passwords do not match.", file=sys.stderr)
+        print("两次输入的密码不一致。", file=sys.stderr)
         return 2
 
     initialize_database()
@@ -51,10 +51,10 @@ def add_admin() -> int:
             (username, hash_password(password), int(time.time())),
         )
     except sqlite3.IntegrityError:
-        print(f"Administrator '{username}' already exists.", file=sys.stderr)
+        print(f"管理员“{username}”已存在。", file=sys.stderr)
         return 3
     finally:
         connection.close()
 
-    print(f"Administrator '{username}' created.")
+    print(f"管理员“{username}”已创建。")
     return 0

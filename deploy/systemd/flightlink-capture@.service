@@ -9,7 +9,7 @@ User=flightlink-capture
 Group=flightlink-capture
 EnvironmentFile=/etc/flightlink/capture.env
 Environment=TZ=UTC
-ExecStart=/usr/bin/python3 /usr/local/sbin/flightlink-capture-runner %i
+ExecStart=/opt/flightlink/backend/.venv/bin/python /usr/local/sbin/flightlink-capture-runner %i
 Restart=on-failure
 RestartSec=2s
 KillSignal=SIGTERM

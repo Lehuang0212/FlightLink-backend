@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,6 +16,7 @@ from ..schemas.channels import CaptureFilePublic
 _CAPTURE_NAME = re.compile(
     r"^channel-([0-9a-f-]{36})-([0-9a-f]{8})-(\d{8}-\d{6})-(\d{10})\.pcap$"
 )
+logger = logging.getLogger(__name__)
 
 
 class CaptureFileError(RuntimeError):
@@ -229,7 +231,8 @@ def clean_capture_files() -> tuple[int, int]:
             path.unlink()
         except FileNotFoundError:
             return True
-        except OSError:
+        except OSError as exc:
+            logger.warning("Unable to remove expired packet capture file %s: %s", path, exc)
             return False
         deleted_count += 1
         deleted_bytes += size

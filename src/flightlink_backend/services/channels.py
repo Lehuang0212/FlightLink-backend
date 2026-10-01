@@ -66,9 +66,17 @@ def _render_row_config(row: sqlite3.Row) -> str:
     )
 
 
-def _allocate_monitor_udp_port(connection: sqlite3.Connection) -> int:
+def _allocate_monitor_udp_port(
+    connection: sqlite3.Connection,
+    payload: ChannelWrite,
+) -> int:
     """Find a free loopback UDP port reserved for this channel's telemetry mirror."""
+    excluded_ports = {payload.uav_udp_port}
+    if payload.ground_station_protocol == "udp":
+        excluded_ports.add(payload.ground_station_port)
     for port in range(40000, 50000):
+        if port in excluded_ports:
+            continue
         used = connection.execute(
             """
             SELECT 1 FROM port_channels WHERE monitor_udp_port = ?
@@ -135,12 +143,14 @@ def get_channel(connection: sqlite3.Connection, channel_id: UUID) -> ChannelPubl
 def create_channel(
     connection: sqlite3.Connection,
     payload: ChannelWrite,
+    *,
+    channel_id: UUID | None = None,
 ) -> ChannelPublic:
-    channel_id = str(uuid4())
+    channel_id = str(channel_id or uuid4())
     now = int(time.time())
     connection.execute("BEGIN IMMEDIATE")
     try:
-        monitor_udp_port = _allocate_monitor_udp_port(connection)
+        monitor_udp_port = _allocate_monitor_udp_port(connection, payload)
         connection.execute(
             """
             INSERT INTO port_channels(
