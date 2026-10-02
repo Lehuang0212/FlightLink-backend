@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import selectors
 import shutil
@@ -27,6 +28,38 @@ MAX_SUMMARY_LINE = 4096
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("flightlink-capture-runner")
 STOP = threading.Event()
+
+
+class PacketSummaryAssembler:
+    """Join tcpdump -v header and continuation lines into one bounded packet."""
+
+    def __init__(self) -> None:
+        self.pending = b""
+        self.last_line_at = 0.0
+
+    def feed(self, raw_line: bytes) -> bytes | None:
+        line = raw_line.strip()
+        if not line:
+            return None
+        previous = None
+        if re.match(rb"^\d{9,}(?:\.\d+)?\s+", line):
+            previous = self.flush()
+            self.pending = line[:1000]
+        elif self.pending:
+            self.pending = (self.pending + b" " + line)[:1000]
+        self.last_line_at = time.monotonic()
+        return previous
+
+    def flush(self) -> bytes | None:
+        packet = self.pending or None
+        self.pending = b""
+        return packet
+
+    def flush_if_idle(self) -> bytes | None:
+        # A quiet stream must still deliver its final packet without waiting for another.
+        if self.pending and time.monotonic() - self.last_line_at >= 0.2:
+            return self.flush()
+        return None
 
 
 def _stop(_signal: int, _frame: object) -> None:
@@ -168,6 +201,7 @@ def _run(channel_id: UUID) -> int:
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     selector = selectors.DefaultSelector()
     line_buffer = bytearray()
+    packet_assembler = PacketSummaryAssembler()
     pcap: subprocess.Popen[bytes] | None = None
     summary: subprocess.Popen[bytes] | None = None
     registered_stream: object | None = None
@@ -206,10 +240,11 @@ def _run(channel_id: UUID) -> int:
                 os.set_blocking(summary.stdout.fileno(), False)
                 selector.register(summary.stdout, selectors.EVENT_READ)
                 line_buffer.clear()
+                packet_assembler = PacketSummaryAssembler()
                 restart_after = time.monotonic() + 2.0
                 continue
 
-            for key, _ in selector.select(timeout=0.5):
+            for key, _ in selector.select(timeout=0.2):
                 try:
                     chunk = os.read(key.fileobj.fileno(), 8192)
                 except OSError:
@@ -222,13 +257,21 @@ def _run(channel_id: UUID) -> int:
                     line_buffer = bytearray(remainder)
                     if not raw_line:
                         continue
-                    summary_line = raw_line[:MAX_SUMMARY_LINE].strip()
+                    summary_line = packet_assembler.feed(raw_line[:MAX_SUMMARY_LINE])
+                    if summary_line:
+                        try:
+                            sender.sendto(PACKET_PREFIX + summary_line, ("127.0.0.1", monitor_port))
+                        except OSError:
+                            pass
+                if len(line_buffer) > MAX_SUMMARY_LINE:
+                    line_buffer.clear()
+            if not line_buffer:
+                summary_line = packet_assembler.flush_if_idle()
+                if summary_line:
                     try:
                         sender.sendto(PACKET_PREFIX + summary_line, ("127.0.0.1", monitor_port))
                     except OSError:
                         pass
-                if len(line_buffer) > MAX_SUMMARY_LINE:
-                    line_buffer.clear()
             if time.monotonic() - last_marker_refresh >= 10.0:
                 try:
                     os.utime(marker, None)

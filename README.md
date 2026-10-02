@@ -439,3 +439,27 @@ This script installs the backend only. Build and deploy the front end and its Ng
 To deploy a backend update, run `sudo git pull --ff-only` in the repository, then run `sudo bash deploy/flightlink-run` again. The script syncs dependencies, reloads service configuration, and restarts the API without changing `/var/lib/flightlink` data.
 
 There is no public registration endpoint. Administrator accounts are created only through ConsoleUseradd.
+
+## 高频读取与 Router 统计 / Frequent reads and Router statistics
+
+### 中文
+
+前端遥测按 1 秒读取时，Router 与抓包服务的只读状态在单个 API 进程中缓存 3 秒，Router 日志缓存 2 秒。同一端口组的读取仍与生命周期操作共用互斥锁；启动、停止及重启前会清除对应缓存。增删改和服务协调使用实时状态，不依赖页面只读缓存，遥测快照也不使用这层缓存。
+
+生成的配置已启用 `ReportStats = true`。日志辅助程序使用 `journalctl --output=cat` 保留原始大括号、换行和缩进；能获取当前服务 InvocationID 时，仅读取该次运行的记录，无运行 ID 时读取本次系统启动内的历史记录。前端显示原生端点的最新完整统计，不补造 BinLog/TLog 端点，不将 Router 序号丢失计数替换为后端 MAVLink 链路质量计数。
+
+部署本次更新时，按上文更新仓库后重新执行 `sudo bash deploy/flightlink-run`，以同步安装新的辅助程序并重启 API；只更新 Python 文件不会替换系统中已安装的日志辅助程序。请继续保持单 API worker 的既定部署方式。真实 Ubuntu/Rocky journal 输出、服务权限和硬件连通需要在 ECS 上验收。
+
+### English
+
+For one-second frontend telemetry polling, read-only Router and capture-service status is cached for three seconds per API process; Router logs are cached for two seconds. Reads share the existing per-channel lifecycle lock. Start, stop and restart invalidate the channel cache before executing. Lifecycle reconciliation uses live status, and telemetry snapshots are not cached by this layer.
+
+Generated configs already enable `ReportStats = true`. The helper uses `journalctl --output=cat` to preserve native braces, line breaks and indentation. When a service InvocationID is available, logs are scoped to that run; otherwise the helper reads history from the current system boot. The frontend displays native complete endpoint statistics without inventing BinLog/TLog endpoints or substituting backend MAVLink quality counters for Router sequence-loss statistics.
+
+After updating the repository, rerun `sudo bash deploy/flightlink-run` to install the updated helper and restart the API. Updating Python files alone does not replace the installed helper. Retain the existing single-worker API deployment. Actual Ubuntu/Rocky journal output, service permissions and hardware connectivity still require ECS acceptance.
+
+### 抓包摘要修复 / Packet summary fix
+
+抓包辅助程序把 `tcpdump -v` 的报文头和续行合并后才转发摘要，保留原始抓包时间、源／目标 IP 与端口、协议和 IP 长度，避免把无地址的报文头单独显示为“未知来源”。末尾报文在约 0.2 秒的空闲等待后发送；重启抓包进程会清空未完成记录。更新后需重新运行安装脚本替换 `/usr/local/sbin/flightlink-capture-runner`，并重启已有的 `flightlink-capture@<端口组 UUID>.service`；API 重启不会自动重启已运行的抓包服务。抓包重启期间会有短暂采集间隙，随后新片段恢复写入。
+
+The capture helper joins tcpdump verbose headers and continuation lines before forwarding a packet summary, preserving capture time, source/destination IP and port, protocol and IP length. Header-only rows are no longer emitted separately as unknown-address packets. The final record is sent after approximately 0.2 seconds of idle time; capture-process restarts discard unfinished records. Rerun the installer to replace `/usr/local/sbin/flightlink-capture-runner`, then restart existing `flightlink-capture@<channel UUID>.service` units. Restarting the API alone does not restart running capture services. Capture restarts create a brief recording gap before a new file resumes recording.

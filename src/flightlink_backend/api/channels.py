@@ -48,7 +48,9 @@ def _with_runtime(
     error: str | None = None,
     capture_runtime: RouterRuntimePublic | None = None,
 ) -> ChannelPublic:
-    runtime = get_router_manager().status(channel.id)
+    router_manager = get_router_manager()
+    capture_manager = get_capture_manager()
+    runtime = getattr(router_manager, 'read_status', router_manager.status)(channel.id)
     if error:
         runtime = runtime.model_copy(update={"error": error})
     telemetry_monitor = get_mavlink_telemetry_monitor()
@@ -69,7 +71,7 @@ def _with_runtime(
     return channel.model_copy(
         update={
             "runtime": runtime,
-            "capture_runtime": capture_runtime or get_capture_manager().status(channel.id),
+            "capture_runtime": capture_runtime or getattr(capture_manager, 'read_status', capture_manager.status)(channel.id),
             "telemetry": telemetry,
         }
     )

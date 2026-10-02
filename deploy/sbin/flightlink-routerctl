@@ -60,6 +60,19 @@ def main(arguments: list[str]) -> int:
             return fail("Log limit must be an integer")
         if not 1 <= limit <= 500:
             return fail("Log limit must be between 1 and 500")
+        # Restrict snapshots to the latest service run so restarted endpoints do not linger.
+        try:
+            invocation = subprocess.run(
+                [SYSTEMCTL, "show", "--property=InvocationID", "--value", unit],
+                check=False, text=True, capture_output=True,
+            )
+        except OSError as exc:
+            return fail(f"Unable to inspect service invocation: {exc}", 1)
+        if invocation.returncode != 0:
+            return fail("Unable to inspect service invocation", 1)
+        invocation_id = invocation.stdout.strip()
+        if invocation_id and not re.fullmatch(r"[0-9a-fA-F]{32}", invocation_id):
+            return fail("Invalid service invocation ID", 1)
         command = [
             JOURNALCTL,
             "--unit",
@@ -67,8 +80,11 @@ def main(arguments: list[str]) -> int:
             "--no-pager",
             "--lines",
             str(limit),
-            "--output=short-iso",
+            "--output=cat",
+            "--boot=0",
         ]
+        if invocation_id:
+            command.append(f"_SYSTEMD_INVOCATION_ID={invocation_id}")
     else:
         return fail("Unsupported action or invalid argument count")
 

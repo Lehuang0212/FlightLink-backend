@@ -6,6 +6,7 @@ from uuid import UUID
 
 from ..config import settings
 from ..schemas.channels import RouterRuntimePublic
+from .read_cache import ServiceReadCache
 
 
 class CaptureManagerError(RuntimeError):
@@ -23,7 +24,15 @@ class CaptureManager(Protocol):
 
 
 class SystemdCaptureManager:
+    def __init__(self) -> None:
+        self._read_cache = ServiceReadCache()
+
+    def read_status(self, channel_id: UUID) -> RouterRuntimePublic:
+        return self._read_cache.read(channel_id, 'status', 3.0, lambda: self.status(channel_id))
+
     def _invoke(self, action: str, channel_id: UUID) -> subprocess.CompletedProcess[str]:
+        if action in {'start', 'stop', 'restart'}:
+            self._read_cache.invalidate(channel_id)
         command = [
             str(settings.sudo_path),
             "-n",
