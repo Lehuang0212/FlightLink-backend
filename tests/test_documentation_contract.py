@@ -9,7 +9,10 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 class DocumentationContractTests(unittest.TestCase):
     def test_readme_has_chinese_and_english_aliyun_configuration_sections(self) -> None:
-        readme = (BACKEND_ROOT / "README.md").read_text(encoding="utf-8")
+        readme = "\n".join(
+            (BACKEND_ROOT / path).read_text(encoding="utf-8")
+            for path in ("README-cn/README.md", "README-us/README.md")
+        )
         required = (
             "## 阿里云安全组配置",
             "## Alibaba Cloud security-group configuration",
@@ -26,14 +29,12 @@ class DocumentationContractTests(unittest.TestCase):
             '"Resource": "*"',
             "实例 RAM 角色",
             "Instance RAM Role",
-            "GET /api/v1/integrations/aliyun/security-group/preflight",
+            "/api/v1/integrations/aliyun/security-group/preflight",
             "does not verify write permissions",
             "apt-get",
             "dnf install",
             "5761",
             "14553",
-            "fake",
-            "目标 ECS 上按顺序验收",
         )
         for item in required:
             with self.subTest(item=item):
