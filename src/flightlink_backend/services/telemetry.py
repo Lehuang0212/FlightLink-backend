@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pymavlink.dialects.v20 import ardupilotmega as mavlink2
 
@@ -224,13 +224,15 @@ def _parse_packet_summary(raw: bytes) -> PacketSummaryPublic:
     )
 
 
-def _tcp_peers_for_port(port: int) -> list[str]:
+def _tcp_peers_for_port(port: int) -> list[str] | None:
     """Read established TCP peers from procfs without requiring root or shell tools."""
     peers: list[str] = []
+    readable = False
     for table, ipv6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
         try:
             with open(table, encoding="ascii") as stream:
                 next(stream, None)
+                readable = True
                 for line in stream:
                     fields = line.split()
                     if len(fields) < 4 or fields[3] != "01":
@@ -246,7 +248,7 @@ def _tcp_peers_for_port(port: int) -> list[str]:
                         peers.append(peer)
         except (OSError, ValueError, IndexError):
             continue
-    return peers
+    return peers if readable else None
 
 
 class _ChannelState:
@@ -284,6 +286,9 @@ class _ChannelState:
         self.last_quality_decay = time.monotonic()
         self.uav_bytes: deque[tuple[float, int]] = deque()
         self.gcs_bytes: deque[tuple[float, int]] = deque()
+        self.history_epoch = uuid4().hex
+        self.message_epoch = self.history_epoch
+        self.packet_count = self.message_count = 0
         self.messages: deque[FlightMessagePublic] = deque(maxlen=MESSAGE_HISTORY_LIMIT)
         self.packet_summaries: deque[PacketSummaryPublic] = deque(maxlen=PACKET_HISTORY_LIMIT)
 
@@ -298,6 +303,7 @@ class _ChannelState:
         destination_endpoint = _parse_public_endpoint(summary.destination or "")
         now = time.monotonic()
         with self.lock:
+            self.packet_count += 1
             self.packet_summaries.append(summary)
             if (
                 summary.protocol == "UDP"
@@ -354,6 +360,8 @@ class _ChannelState:
         self.last_quality_decay = self.last_counter_decay
         self.uav_bytes.clear()
         self.messages.clear()
+        self.message_epoch = uuid4().hex
+        self.message_count = 0
 
     def _record_vehicle_packet(self, sequence: int, frame_bytes: int, now: float) -> None:
         self._decay_packet_counters(now)
@@ -489,6 +497,7 @@ class _ChannelState:
                 severity_value = int(fields.get("severity", -1))
                 message_text = _decode_text(fields.get("text", ""))
                 if message_text:
+                    self.message_count += 1
                     self.messages.append(
                         FlightMessagePublic(
                             received_at=_utc_now().isoformat(),
@@ -575,6 +584,7 @@ class _ChannelState:
                 ),
                 uav_rx_bytes_per_second=round(uav_rate, 1),
                 gcs_tx_bytes_per_second=round(gcs_rate, 1),
+                ground_station_observable=ground_station_protocol != 'tcp' or peers is not None,
                 ground_station_connected=gcs_connected,
                 ground_station_peer=gcs_peer,
                 ground_station_last_packet_at=self.last_gcs_packet_at,
@@ -719,6 +729,23 @@ class MavlinkTelemetryMonitor:
             ground_station_protocol=ground_station_protocol,
             ground_station_port=ground_station_port,
         )
+
+    def history(self, channel_id: UUID, kind: str, limit: int, after: str | None) -> dict:
+        with self._lock:
+            listener = self._listeners.get(channel_id)
+        if listener is None:
+            return {kind: [], 'cursor': None, 'reset': True}
+        state = listener.state
+        with state.lock:
+            if kind == 'messages':
+                epoch, total, items = state.message_epoch, state.message_count, state.messages
+            else:
+                epoch, total, items = state.history_epoch, state.packet_count, state.packet_summaries
+            prefix, _, pos = (after or '').partition(':')
+            gap = total - int(pos) if prefix == epoch and pos.isascii() and pos.isdigit() and len(pos) <= 20 else -1
+            reset = not (0 <= gap <= min(limit, len(items)))
+            size = limit if reset else gap
+            return {kind: list(items)[-size:] if size else [], 'cursor': f'{epoch}:{total}', 'reset': reset}
 
     def messages(self, channel_id: UUID, limit: int) -> list[FlightMessagePublic]:
         with self._lock:

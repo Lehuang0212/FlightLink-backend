@@ -6,7 +6,7 @@ from collections.abc import Generator
 
 from .config import settings
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def connect() -> sqlite3.Connection:
@@ -198,11 +198,20 @@ def _migration_4(connection: sqlite3.Connection) -> None:
         "CREATE INDEX security_group_rules_channel_role_idx "
         "ON security_group_rules(channel_id, role)"
     )
+
+
+def _migration_5(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE port_channels ADD COLUMN runtime_intent TEXT NOT NULL DEFAULT 'blocked' CHECK(runtime_intent IN ('blocked','applied','deleting'))")
+    # Old error rows cannot distinguish an interrupted delete from a failed edit.
+    connection.execute("UPDATE port_channels SET runtime_intent='applied' WHERE security_group_state IN ('synced','disabled')")
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
 }
 
 

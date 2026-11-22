@@ -151,12 +151,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:", isolation_level=None)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
-        for migration in (
-            database._migration_1,
-            database._migration_2,
-            database._migration_3,
-            database._migration_4,
-        ):
+        for migration in database.MIGRATIONS.values():
             migration(self.connection)
 
         self.events: list[tuple] = []
@@ -273,6 +268,9 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
 
         self.assertEqual(channel.security_group.state, "error")
         self.assertIsNotNone(channel.security_group.error)
+        persisted = self.channel_services.get_channel(self.connection, channel.id)
+        self.channel_runtime.reconcile_channel_runtime(persisted)
+        self.assertFalse(persisted.should_run)
         self.assertFalse(any(event in {("router", "start"), ("capture", "start")} for event in self.events))
         self.assertIsNotNone(
             self.connection.execute(
@@ -307,12 +305,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         setup = sqlite3.connect(database_path, isolation_level=None)
         setup.row_factory = sqlite3.Row
         setup.execute("PRAGMA foreign_keys = ON")
-        for migration in (
-            database._migration_1,
-            database._migration_2,
-            database._migration_3,
-            database._migration_4,
-        ):
+        for migration in database.MIGRATIONS.values():
             migration(setup)
         channel = self.service.create_managed_channel(setup, self.default_payload)
         setup.close()
@@ -393,12 +386,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         setup = sqlite3.connect(database_path, isolation_level=None)
         setup.row_factory = sqlite3.Row
         setup.execute("PRAGMA foreign_keys = ON")
-        for migration in (
-            database._migration_1,
-            database._migration_2,
-            database._migration_3,
-            database._migration_4,
-        ):
+        for migration in database.MIGRATIONS.values():
             migration(setup)
         channel = self.service.create_managed_channel(setup, self.default_payload)
         setup.close()
@@ -473,12 +461,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         setup = sqlite3.connect(database_path, isolation_level=None)
         setup.row_factory = sqlite3.Row
         setup.execute("PRAGMA foreign_keys = ON")
-        for migration in (
-            database._migration_1,
-            database._migration_2,
-            database._migration_3,
-            database._migration_4,
-        ):
+        for migration in database.MIGRATIONS.values():
             migration(setup)
         setup.close()
 
@@ -560,12 +543,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         setup = sqlite3.connect(database_path, isolation_level=None)
         setup.row_factory = sqlite3.Row
         setup.execute("PRAGMA foreign_keys = ON")
-        for migration in (
-            database._migration_1,
-            database._migration_2,
-            database._migration_3,
-            database._migration_4,
-        ):
+        for migration in database.MIGRATIONS.values():
             migration(setup)
         channel = self.service.create_managed_channel(setup, self.default_payload)
         setup.close()
@@ -581,11 +559,18 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
 
         def pause_old_monitor_start(channel_id, monitor_port, uav_port, ground_port):
             if uav_port == self.default_payload.uav_udp_port:
-                get_at_monitor_start.set()
-                if not release_get.wait(5):
-                    raise TimeoutError("test did not release runtime read")
+                raise AssertionError('GET must not start telemetry')
             current_monitor_ports[str(channel_id)] = (monitor_port, uav_port, ground_port)
             return original_start(channel_id, monitor_port, uav_port, ground_port)
+
+        original_snapshot = self.telemetry.snapshot
+
+        def pause_snapshot(*args, **kwargs):
+            if kwargs['ground_station_port'] == self.default_payload.ground_station_port:
+                get_at_monitor_start.set()
+                if not release_get.wait(5):
+                    raise TimeoutError('test did not release snapshot')
+            return original_snapshot(*args, **kwargs)
 
         def observe_update_sync(connection, channel_id, payload):
             if payload.uav_udp_port == 5763:
@@ -617,7 +602,7 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
             finally:
                 connection.close()
 
-        with patch.object(self.telemetry, "start", pause_old_monitor_start), patch.object(
+        with patch.object(self.telemetry, 'snapshot', pause_snapshot), patch.object(self.telemetry, "start", pause_old_monitor_start), patch.object(
             self.service, "ensure_channel_rules", observe_update_sync
         ), patch.object(api_channels, "get_router_manager", return_value=self.router), patch.object(
             api_channels, "get_capture_manager", return_value=self.capture
@@ -729,6 +714,11 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
         with self.assertRaises(self.service.ChannelSecurityGroupFailure):
             self.service.delete_managed_channel(self.connection, channel.id)
 
+        persisted = self.channel_services.get_channel(self.connection, channel.id)
+        self.assertEqual(persisted.runtime_intent, 'deleting')
+        self.channel_runtime.reconcile_channel_runtime(persisted)
+        self.assertEqual(self.router.state, 'inactive')
+        self.assertEqual(self.capture.state, 'inactive')
         capture_stop = self.events.index(("capture", "stop"))
         router_stop = self.events.index(("router", "stop"))
         revoke = next(index for index, event in enumerate(self.events) if event[0] == "revoke")
@@ -769,6 +759,14 @@ class ChannelSecurityGroupLifecycleTests(unittest.TestCase):
             ).fetchone()
         )
         self.assertEqual(self.provider.rules, [])
+
+    def test_capture_restart_failure_does_not_undo_router_change(self):
+        channel = self._create()
+        self.capture.fail_restart = True
+        result = self.service.update_managed_channel(self.connection, channel.id, ChannelWrite(uav_udp_port=6001, ground_station_port=6002))
+        self.assertEqual(result.operation_result, 'degraded')
+        self.assertEqual(result.uav_udp_port, 6001)
+        self.assertTrue(result.should_run)
 
     def test_startup_reconciliation_never_mutates_security_group(self):
         from flightlink_backend import main

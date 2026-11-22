@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from uuid import UUID
 
@@ -54,15 +56,6 @@ def _with_runtime(
     if error:
         runtime = runtime.model_copy(update={"error": error})
     telemetry_monitor = get_mavlink_telemetry_monitor()
-    try:
-        telemetry_monitor.start(
-            channel.id,
-            channel.monitor_udp_port,
-            channel.uav_udp_port,
-            channel.ground_station_port,
-        )
-    except RuntimeError:
-        pass
     telemetry = telemetry_monitor.snapshot(
         channel.id,
         ground_station_protocol=channel.ground_station_protocol,
@@ -199,10 +192,10 @@ def restart_channel(
             channel = get_channel(connection, channel_id)
         except ChannelNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
-        if not channel.enabled:
+        if not channel.should_run:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Disabled channels cannot be restarted",
+                detail="Only enabled channels with an applied configuration can be restarted",
             )
         try:
             runtime = restart_router_service(channel_id)
@@ -211,12 +204,17 @@ def restart_channel(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Router service restart failed: {exc}",
             ) from exc
+        try:
+            get_mavlink_telemetry_monitor().start(channel.id, channel.monitor_udp_port, channel.uav_udp_port, channel.ground_station_port)
+        except RuntimeError:
+            pass  # Preserve the monitor error in the returned snapshot.
         return _with_runtime(channel.model_copy(update={"runtime": runtime}))
 
 
 @router.get("/{channel_id}/logs")
 def read_channel_logs(
     channel_id: UUID,
+    after: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=100, ge=1, le=500),
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
@@ -232,12 +230,15 @@ def read_channel_logs(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Router logs are unavailable: {exc}",
         ) from exc
-    return {"channel_id": str(channel_id), "lines": result.lines}
+    cursor = hashlib.sha256(json.dumps(result.lines, ensure_ascii=False).encode()).hexdigest()
+    return {'channel_id': str(channel_id), 'cursor': cursor, 'reset': cursor != after,
+            'lines': result.lines if cursor != after else []}
 
 
 @router.get("/{channel_id}/messages")
 def read_flight_messages(
     channel_id: UUID,
+    after: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=100, ge=1, le=500),
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
@@ -246,13 +247,13 @@ def read_flight_messages(
         get_channel(connection, channel_id)
     except ChannelNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found") from exc
-    messages = get_mavlink_telemetry_monitor().messages(channel_id, limit)
-    return {"channel_id": str(channel_id), "messages": messages}
+    return {'channel_id': str(channel_id), **get_mavlink_telemetry_monitor().history(channel_id, 'messages', limit, after)}
 
 
 @router.get("/{channel_id}/packets")
 def read_packet_summaries(
     channel_id: UUID,
+    after: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=100, ge=1, le=500),
     _: AdminPublic = Depends(get_current_admin),
     connection: sqlite3.Connection = Depends(get_db),
@@ -263,8 +264,7 @@ def read_packet_summaries(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Channel not found"
         ) from exc
-    packets = get_mavlink_telemetry_monitor().packets(channel_id, limit)
-    return {"channel_id": str(channel_id), "packets": packets}
+    return {'channel_id': str(channel_id), **get_mavlink_telemetry_monitor().history(channel_id, 'packets', limit, after)}
 
 
 @router.get("/{channel_id}/captures")

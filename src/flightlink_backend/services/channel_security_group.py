@@ -99,6 +99,17 @@ def _set_update_failure(
     )
 
 
+def _intent(connection, channel_id, value):
+    connection.execute('UPDATE port_channels SET runtime_intent=? WHERE id=?', (value, str(channel_id)))
+
+
+def _result(channel: ChannelPublic) -> ChannelPublic:
+    expected = {'active', 'starting'} if channel.enabled else {'inactive', 'stopping'}
+    degraded = (channel.security_group.state in {'cleanup_pending', 'error'} or
+                any(item.error or item.state not in expected for item in (channel.runtime, channel.capture_runtime)))
+    return channel.model_copy(update={'operation_result': 'degraded' if degraded else 'applied'})
+
+
 def _runtime_ready(channel: ChannelPublic) -> bool:
     return runtime_matches_channel(channel)
 
@@ -114,8 +125,9 @@ def create_managed_channel(
         result = ensure_channel_rules(connection, channel.id, payload)
         channel = get_channel(connection, channel.id)
         if result.state not in {"synced", "disabled"}:
-            return channel
-        return reconcile_channel_runtime(channel)
+            return channel.model_copy(update={'operation_result': 'not_applied'})
+        _intent(connection, channel.id, 'applied')
+        return _result(reconcile_channel_runtime(get_channel(connection, channel.id)))
 
 
 def update_managed_channel(
@@ -134,6 +146,8 @@ def _update_managed_channel_locked(
 ) -> ChannelPublic:
     """Add replacement ingress, switch runtime, then clean old managed rules."""
     old_channel = get_channel(connection, channel_id)
+    if old_channel.runtime_intent == 'deleting':
+        raise ChannelSecurityGroupFailure('Deletion pending; retry deletion before editing')
     old_payload = _payload_for(old_channel)
     previous_record_ids = {
         record.id
@@ -180,7 +194,7 @@ def _update_managed_channel_locked(
                 "error",
                 sync_result.error or _UPDATE_ERROR,
             )
-        return get_channel(connection, channel_id)
+        return get_channel(connection, channel_id).model_copy(update={'operation_result': 'not_applied'})
 
     try:
         updated = update_channel(connection, channel_id, payload)
@@ -201,15 +215,18 @@ def _update_managed_channel_locked(
             )
         raise
 
-    active_result = reconcile_channel_runtime(updated, restart_if_active=True)
+    _intent(connection, channel_id, 'applied')
+    active_result = reconcile_channel_runtime(updated.model_copy(update={'runtime_intent': 'applied'}), restart_if_active=True)
     if not _runtime_ready(active_result):
         try:
+            _intent(connection, channel_id, old_channel.runtime_intent)
             restored = update_channel(connection, channel_id, old_payload)
         except Exception:
             set_channel_security_group_state(
                 connection, channel_id, "error", _ROLLBACK_ERROR
             )
-            return get_channel(connection, channel_id)
+            _intent(connection, channel_id, 'blocked')
+            return get_channel(connection, channel_id).model_copy(update={'operation_result': 'degraded'})
         restored_runtime = reconcile_channel_runtime(
             restored, restart_if_active=True
         )
@@ -220,13 +237,11 @@ def _update_managed_channel_locked(
             connection, channel_id, cleanup_failed=not cleanup_ok
         )
         current = get_channel(connection, channel_id)
-        return restored_runtime.model_copy(update={"security_group": current.security_group})
+        return restored_runtime.model_copy(update={'security_group': current.security_group, 'operation_result': 'not_applied'})
 
-    cleanup_result = cleanup_stale_channel_rules(connection, channel_id, payload)
+    cleanup_stale_channel_rules(connection, channel_id, payload)
     current = get_channel(connection, channel_id)
-    if cleanup_result.state == "error":
-        return active_result.model_copy(update={"security_group": current.security_group})
-    return active_result.model_copy(update={"security_group": current.security_group})
+    return _result(active_result.model_copy(update={'security_group': current.security_group}))
 
 
 def delete_managed_channel(
@@ -243,8 +258,10 @@ def _delete_managed_channel_locked(
 ) -> None:
     """Stop services, revoke mapped rules, then remove channel-owned local state."""
     get_channel(connection, channel_id)
+    _intent(connection, channel_id, 'deleting')
     stop_capture_service(channel_id)
     stop_router_service(channel_id)
+    get_mavlink_telemetry_monitor().stop(channel_id)
 
     result = revoke_channel_rules(connection, channel_id)
     remaining = list_rule_records(connection, channel_id)
@@ -253,4 +270,3 @@ def _delete_managed_channel_locked(
 
     remove_capture_config(channel_id)
     delete_channel(connection, channel_id)
-    get_mavlink_telemetry_monitor().stop(channel_id)

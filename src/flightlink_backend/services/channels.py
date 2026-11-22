@@ -32,6 +32,7 @@ class ChannelConfigFailure(RuntimeError):
 def _as_public(row: sqlite3.Row) -> ChannelPublic:
     return ChannelPublic(
         id=UUID(row["id"]),
+        runtime_intent=row['runtime_intent'],
         uav_udp_port=row["uav_udp_port"],
         ground_station_port=row["ground_station_port"],
         monitor_udp_port=row["monitor_udp_port"],

@@ -78,6 +78,7 @@ class ChannelTelemetryPublic(BaseModel):
     last_packet_age_seconds: float | None = None
     uav_rx_bytes_per_second: float = 0
     gcs_tx_bytes_per_second: float = 0
+    ground_station_observable: bool = False
     ground_station_connected: bool = False
     ground_station_peer: str | None = None
     ground_station_last_packet_at: str | None = None
@@ -94,6 +95,13 @@ class ChannelWrite(BaseModel):
 
 
 class ChannelPublic(BaseModel):
+    runtime_intent: Literal['blocked', 'applied', 'deleting'] = 'blocked'
+    operation_result: Literal['applied', 'not_applied', 'degraded'] | None = None
+
+    @property
+    def should_run(self) -> bool:
+        return self.enabled and self.runtime_intent == 'applied'
+
     id: UUID
     uav_udp_port: int
     ground_station_port: int

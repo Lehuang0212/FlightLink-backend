@@ -16,34 +16,33 @@ def reconcile_channel_runtime(
     """Apply telemetry, router, and capture runtime state for one local channel."""
     telemetry_monitor = get_mavlink_telemetry_monitor()
     try:
-        telemetry_monitor.start(
-            channel.id,
-            channel.monitor_udp_port,
-            channel.uav_udp_port,
-            channel.ground_station_port,
-        )
+        if channel.should_run:
+            telemetry_monitor.start(channel.id, channel.monitor_udp_port, channel.uav_udp_port, channel.ground_station_port)
+        else:
+            telemetry_monitor.stop(channel.id)
     except RuntimeError:
         # The channel remains manageable; its telemetry snapshot reports availability.
         pass
 
     runtime = reconcile_router_service(
         channel.id,
-        enabled=channel.enabled,
+        enabled=channel.should_run,
         restart_if_active=restart_if_active,
     )
     capture_manager = get_capture_manager()
     capture_runtime = capture_manager.status(channel.id)
     try:
-        write_capture_config(
-            channel.id,
-            uav_udp_port=channel.uav_udp_port,
-            ground_station_port=channel.ground_station_port,
-            ground_station_protocol=channel.ground_station_protocol,
-            monitor_udp_port=channel.monitor_udp_port,
-        )
+        if channel.should_run:
+            write_capture_config(
+                channel.id,
+                uav_udp_port=channel.uav_udp_port,
+                ground_station_port=channel.ground_station_port,
+                ground_station_protocol=channel.ground_station_protocol,
+                monitor_udp_port=channel.monitor_udp_port,
+            )
         capture_runtime = reconcile_capture_service(
             channel.id,
-            enabled=channel.enabled,
+            enabled=channel.should_run,
             restart_if_active=restart_if_active,
         )
     except CaptureFileError as exc:
@@ -68,13 +67,13 @@ def runtime_matches_channel(channel: ChannelPublic) -> bool:
     if settings.router_manager_mode == "disabled":
         return True
 
-    if channel.runtime.error or channel.capture_runtime.error:
+    if channel.runtime.error:
         return False
     if channel.enabled:
         expected = {"active", "starting"}
     else:
         expected = {"inactive", "stopping"}
-    return (
-        channel.runtime.state in expected
-        and channel.capture_runtime.state in expected
+    # Capture is diagnostic when running. Disabling still requires it to stop.
+    return channel.runtime.state in expected and (
+        channel.enabled or (not channel.capture_runtime.error and channel.capture_runtime.state in expected)
     )

@@ -87,7 +87,8 @@ class SecurityGroupRecordTests(unittest.TestCase):
                     "WHERE type = 'table' AND name = 'security_group_rules'"
                 ).fetchone()
 
-                self.assertEqual(version, 4)
+                self.assertEqual(version, database.SCHEMA_VERSION)
+                self.assertEqual(channel['runtime_intent'], 'blocked')
                 self.assertEqual(channel["uav_udp_port"], 5761)
                 self.assertEqual(channel["ground_station_port"], 14553)
                 self.assertEqual(channel["security_group_state"], "pending")
