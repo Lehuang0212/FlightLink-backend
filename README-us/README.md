@@ -64,13 +64,11 @@ sudo dnf install -y git
 The installer requires `/opt/flightlink/backend`:
 
 ```bash
-sudo install -d -o root -g root -m 0755 /opt/flightlink
 sudo git clone https://github.com/Lehuang0212/FlightLink-backend.git /opt/flightlink/backend
-cd /opt/flightlink/backend
-sudo bash deploy/flightlink-run
+sudo bash /opt/flightlink/backend/deploy/flightlink-run
 ```
 
-Answer the prompts:
+Select 中文 or English on the first interactive installation. For an older installation, back up the database in a maintenance window, run `sudo git -C /opt/flightlink/backend pull --ff-only origin main`, then run the installer above once to install the CLI.
 
 | Setting | Value |
 | --- | --- |
@@ -90,7 +88,7 @@ curl -fsS http://127.0.0.1:8000/api/v1/health
 
 FastAPI listens on `127.0.0.1:8000`. Nginx serves the management UI; do not expose public port `8000`.
 
-### 3. Configure the environment
+### 3. Configure the environment (only for later manual changes)
 
 ```bash
 sudo vi /etc/flightlink/api.env
@@ -118,10 +116,7 @@ sudo systemctl restart flightlink-api.service
 The installer prompts for the first administrator. Add more with:
 
 ```bash
-sudo -u flightlink-api env \
-  FLIGHTLINK_DATA_DIR=/var/lib/flightlink \
-  FLIGHTLINK_DATABASE_PATH=/var/lib/flightlink/flightlink.sqlite3 \
-  /opt/flightlink/backend/.venv/bin/ConsoleUseradd
+sudo flightlink admin
 ```
 
 ### 5. Connect the UAV and QGC
@@ -138,18 +133,14 @@ sudo -u flightlink-api env \
 ### 6. Update and inspect logs
 
 ```bash
-cd /opt/flightlink/backend
-sudo git pull --ff-only origin main
-sudo bash deploy/flightlink-run
+sudo flightlink update
 sudo journalctl -u flightlink-api.service -n 100 --no-pager
 sudo journalctl -u 'flightlink-router@*.service' -n 100 --no-pager
 ```
 
-After updating the capture helper, restart an already-running capture instance if necessary. Replace the UUID:
+Use `sudo flightlink <command>` from any directory: `language` selects interactively; `language zh` and `language en` persist the host-wide choice in `/etc/flightlink/language` without restarting services. Native tool output is not translated. `status` lists services, channel configuration and listeners. `stop` pauses all channels; `start` resumes without changing boot policy. `disable` stops and disables boot; `enable` enables boot and starts the API.
 
-```bash
-sudo systemctl restart flightlink-capture@CHANNEL_UUID.service
-```
+`update` fast-forwards a clean main checkout, confirms downtime, stops services, backs up and reinstalls. `uninstall` lists the cloud target and tracked rules. Enter `KEEP` to retain them or `CLEAN` to remove tracked rules, then `YES` to confirm downtime. Failed cleanup aborts removal. The checkout, DB backup and configuration copy are kept under `/var/backups/flightlink/`; runtime data, PCAPs, service accounts, OS packages and frontend remain. Review retained configuration and ingress before reinstalling.
 
 ## Alibaba Cloud security-group configuration
 

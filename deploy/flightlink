@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+readonly CONFIG_DIR=/etc/flightlink APP=/opt/flightlink/backend API=flightlink-api.service
+readonly UNIT_DIR=/etc/systemd/system
+source /usr/local/lib/flightlink/language.sh
+err() { say "$@" >&2; exit 1; }
+help_text() {
+    say '用法: sudo flightlink 命令' 'Usage: sudo flightlink COMMAND'
+    say 'status 状态与监听 | start 启动 | stop 暂停全部 | disable 停止并关闭自启 | enable 启动并自启' 'status: inspect | start: start now | stop: pause all | disable: stop and disable boot | enable: start and enable boot'
+    say 'admin 添加管理员 | update 备份并更新 | uninstall 卸载并保留备份 | language [zh|en] 切换语言' 'admin: add administrator | update: back up and update | uninstall: uninstall with backup | language [zh|en]: select language'
+}
+confirm() {
+    local answer
+    say "$@" >&2
+    printf '%s' "$(msg '输入 YES 继续，其他输入取消：' 'Type YES to continue; anything else cancels: ')" >&2
+    IFS= read -r answer && [[ $answer == YES ]] || err '已取消。' 'Cancelled.'
+}
+# Only return FlightLink instance names; do not stop every system service.
+instances() {
+    systemctl list-units --all --no-legend --plain --no-pager 'flightlink-router@*.service' 'flightlink-capture@*.service' | awk '{print $1}'
+}
+maintenance() {
+    systemd-run --quiet --wait --pipe --collect --uid=flightlink-api --working-directory="$APP" \
+      --property="EnvironmentFile=$CONFIG_DIR/api.env" "$APP/.venv/bin/python" -m flightlink_backend.maintenance "$1"
+}
+stop_all() {
+    systemctl stop "$API"
+    local names unit
+    names=$(instances)
+    while IFS= read -r unit; do
+        [[ -z $unit ]] || systemctl stop "$unit"
+    done <<< "$names"
+}
+disable_boot() {
+    systemctl disable "$API"
+    local names unit
+    names=$(systemctl list-unit-files --state=enabled,enabled-runtime --no-legend 'flightlink-router@*.service' 'flightlink-capture@*.service' | awk '{print $1}')
+    while IFS= read -r unit; do [[ -z $unit ]] || systemctl disable "$unit"; done <<< "$names"
+}
+backup() {
+    install -d -m 0700 /var/backups/flightlink
+    BACKUP=$(mktemp -d /var/backups/flightlink/backup-XXXXXXXX)
+    cp -a -- "$CONFIG_DIR" "$BACKUP/config"
+    maintenance backup > "$BACKUP/db.partial"
+    [[ -s $BACKUP/db.partial ]] || err '数据库备份为空。' 'Database backup is empty.'
+    mv -- "$BACKUP/db.partial" "$BACKUP/flightlink.sqlite3"
+    say "备份目录：$BACKUP" "Backup directory: $BACKUP"
+}
+status_report() {
+    systemctl show "$API" -p ActiveState -p UnitFileState
+    systemctl list-units --all --no-pager 'flightlink-router@*.service' 'flightlink-capture@*.service'
+    say '配置：通道 ID / 飞控 UDP / 地面站协议与端口 / 启用 / 运行意图' 'Config: channel ID / UAV UDP / GCS transport and port / enabled / intent'
+    maintenance status
+    say 'Router 实际监听（空表示未观察到）：' 'Observed router listeners (empty = none observed):'
+    ss -H -lnutp | awk '/mavlink-router/'
+}
+main() {
+    local cmd=${1:-help} answer unit
+    if (($#)); then shift; fi
+    if [[ $cmd == language ]]; then
+        (($# <= 1)) || err '用法：flightlink language [zh|en]' 'Usage: flightlink language [zh|en]'
+    elif (($#)); then err '不接受额外参数。' 'Unexpected arguments.'; fi
+    case "$cmd" in help|-h|--help) help_text; return;; language|admin|start|stop|disable|enable|status|update|uninstall) ;; *) help_text >&2; exit 2;; esac
+    [[ $EUID == 0 ]] || err '请使用 sudo。' 'Run with sudo.'
+    umask 077
+    exec 9>/run/flightlink-maintenance.lock
+    flock -n 9 || err '其他管理操作正在运行。' 'Another management operation is running.'
+    case "$cmd" in
+      language) choose_language "$@";;
+      status) status_report;;
+      admin) systemd-run --quiet --wait --pty --collect --uid=flightlink-api --working-directory="$APP" --property="EnvironmentFile=$CONFIG_DIR/api.env" --setenv="FLIGHTLINK_CLI_LANGUAGE=$FL_LANGUAGE" "$APP/.venv/bin/ConsoleUseradd";;
+      start) systemctl start "$API";;
+      enable) systemctl enable --now "$API";;
+      stop|disable)
+        say '以下服务可能受影响：' 'These services may be interrupted:'; instances
+        confirm '这会中断全部通道；保留配置、数据和云规则。' 'All channels will stop. Configuration, data and cloud rules are retained.'
+        stop_all; if [[ $cmd == disable ]]; then disable_boot; fi;;
+      update)
+        [[ $(git -C "$APP" branch --show-current) == main && -z $(git -C "$APP" status --porcelain) ]] || err '需要干净的 main 工作树。' 'A clean main checkout is required.'
+        systemctl is-active --quiet "$API" && systemctl is-enabled --quiet "$API" || err '更新后将启动并启用服务。先明确执行 enable。' 'Updates start and enable the API. Explicitly enable it first.'
+        git -C "$APP" fetch origin main
+        local target; target=$(git -C "$APP" rev-parse FETCH_HEAD)
+        git -C "$APP" merge-base --is-ancestor HEAD "$target" || err '无法快进更新。' 'Update is not a fast-forward.'
+        if [[ $(git -C "$APP" rev-parse HEAD) == "$target" ]]; then say '已经是最新版。' 'Already up to date.'; return; fi
+        instances
+        confirm '备份并更新 main；所有通道将短暂中断。' 'Back up and update main; all channels will be interrupted.'
+        stop_all; backup
+        (umask 022; git -C "$APP" merge --ff-only "$target")
+        (umask 022; bash "$APP/deploy/flightlink-run");;
+      uninstall)
+        say '目标地域、安全组及本地托管规则映射：' 'Configured region, security group and tracked rules:'
+        maintenance rules
+        say '输入 KEEP 保留云规则，CLEAN 清理该目标的托管规则，其他输入取消。' 'Type KEEP to retain cloud rules, CLEAN to clean tracked rules on this target, or anything else to cancel.'
+        IFS= read -r answer && [[ $answer == KEEP || $answer == CLEAN ]] || err '已取消。' 'Cancelled.'
+        instances
+        confirm '停用全部通道，备份数据库与配置，卸载后端服务；保留数据、PCAP、前端和系统依赖。' 'Stop all channels, back up DB/config and uninstall backend services. Data, PCAPs, frontend and system dependencies are kept.'
+        stop_all; disable_boot; backup
+        if [[ $answer == CLEAN ]]; then maintenance clean; fi
+        for unit in "$API" flightlink-router@.service flightlink-capture@.service; do
+            rm -f -- "$UNIT_DIR/$unit"
+        done
+        rm -f -- /usr/local/sbin/flightlink-routerctl /usr/local/sbin/flightlink-capture-runner /etc/sudoers.d/flightlink-router-control
+        systemctl daemon-reload
+        mv -- "$APP" "$BACKUP/backend"
+        say "卸载完成。代码与备份：$BACKUP；数据与配置保留在原位。" "Uninstalled. Checkout and backups: $BACKUP. Data and configuration retained in place."
+        rm -f -- /usr/local/lib/flightlink/language.sh /usr/local/sbin/flightlink;;
+    esac
+}
+trap 'r=$?; say "操作失败（退出码 $r）。请检查上方输出后重试。" "Operation failed (exit $r). Inspect the output before retrying." >&2; exit "$r"' ERR
+main "$@"

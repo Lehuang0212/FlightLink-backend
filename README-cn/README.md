@@ -64,13 +64,11 @@ sudo dnf install -y git
 必须克隆到 `/opt/flightlink/backend`：
 
 ```bash
-sudo install -d -o root -g root -m 0755 /opt/flightlink
 sudo git clone https://github.com/Lehuang0212/FlightLink-backend.git /opt/flightlink/backend
-cd /opt/flightlink/backend
-sudo bash deploy/flightlink-run
+sudo bash /opt/flightlink/backend/deploy/flightlink-run
 ```
 
-按提示填写：
+首次交互安装先选中文或 English，再按提示填写。已有旧版部署：在维护窗口备份数据库，执行 `sudo git -C /opt/flightlink/backend pull --ff-only origin main`，再运行上面的安装脚本一次，安装新版命令。
 
 | 项目 | 填写内容 |
 | --- | --- |
@@ -90,7 +88,7 @@ curl -fsS http://127.0.0.1:8000/api/v1/health
 
 后端只监听 `127.0.0.1:8000`。管理网页由前端 Nginx 提供，不开放公网 `8000`。
 
-### 3. 环境配置
+### 3. 环境配置（仅需手动更改时）
 
 ```bash
 sudo vi /etc/flightlink/api.env
@@ -118,10 +116,7 @@ sudo systemctl restart flightlink-api.service
 首次部署由脚本提示创建；之后使用：
 
 ```bash
-sudo -u flightlink-api env \
-  FLIGHTLINK_DATA_DIR=/var/lib/flightlink \
-  FLIGHTLINK_DATABASE_PATH=/var/lib/flightlink/flightlink.sqlite3 \
-  /opt/flightlink/backend/.venv/bin/ConsoleUseradd
+sudo flightlink admin
 ```
 
 ### 5. 连接无人机和 QGC
@@ -138,18 +133,14 @@ sudo -u flightlink-api env \
 ### 6. 更新与日志
 
 ```bash
-cd /opt/flightlink/backend
-sudo git pull --ff-only origin main
-sudo bash deploy/flightlink-run
+sudo flightlink update
 sudo journalctl -u flightlink-api.service -n 100 --no-pager
 sudo journalctl -u 'flightlink-router@*.service' -n 100 --no-pager
 ```
 
-更新抓包助手后，若已有抓包实例仍在运行，替换下方 UUID 并重启该实例：
+日常运维只需 `sudo flightlink <命令>`：`language` 交互选语言，`language zh` / `language en` 直接切换（全机保存在 `/etc/flightlink/language`，不重启服务）；`status` 查看配置、服务和监听；`stop` 暂停全部通道，`start` 恢复，不改变开机策略；`disable` 停止并取消自启，`enable` 恢复自启并启动。系统工具原始日志不翻译。
 
-```bash
-sudo systemctl restart flightlink-capture@端口组UUID.service
-```
+`update` 仅快进更新干净的 main，确认后停机、备份并重新安装。`uninstall` 会显示目标安全组和托管映射；输入 `KEEP` 保留云规则或 `CLEAN` 清理托管规则，再输入 `YES` 才会停机。清理失败不会继续卸载。代码、数据库备份和配置副本保存在 `/var/backups/flightlink/`；运行数据、PCAP、系统账号、系统依赖和前端保留。重新安装前先核对保留的配置和云规则。
 
 ## 阿里云安全组配置
 
