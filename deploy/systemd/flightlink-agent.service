@@ -1,0 +1,18 @@
+[Unit]
+Description=FlightLink ECS 1.0 Channel Lifecycle & Security Group Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flightlink-agent
+Group=flightlink
+WorkingDirectory=/var/lib/flightlink
+EnvironmentFile=-/etc/flightlink/flightlink.env
+ExecStart=/opt/flightlink/venv/bin/flightlink-agent
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

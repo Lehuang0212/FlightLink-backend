@@ -1,0 +1,19 @@
+[Unit]
+Description=FlightLink Per-Group Isolated mavlink-routerd (%i)
+After=network-online.target
+# Intentionally NOT WantedBy=multi-user.target:
+# ECS host reboot MUST NOT automatically bring up aircraft port groups.
+
+[Service]
+Type=simple
+User=flightlink-agent
+Group=flightlink
+ExecStart=/usr/bin/mavlink-routerd -c /var/lib/flightlink/router.d/%i.conf
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flightlink-router-%i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/flightlink/router.d

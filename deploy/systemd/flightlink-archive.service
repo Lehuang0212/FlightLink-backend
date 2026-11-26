@@ -1,0 +1,22 @@
+[Unit]
+Description=FlightLink ECS 1.0 Continuous Session Archive Collector & 7-Day Retention Cleaner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flightlink-archive
+Group=flightlink
+WorkingDirectory=/var/lib/flightlink
+EnvironmentFile=-/etc/flightlink/flightlink.env
+ExecStart=/opt/flightlink/venv/bin/flightlink-archive
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/flightlink
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

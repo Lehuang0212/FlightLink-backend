@@ -1,13 +1,11 @@
-from fastapi import FastAPI
+"""ASGI entrypoint for `uvicorn main:app`."""
 
-app = FastAPI()
+from __future__ import annotations
 
+from pathlib import Path
 
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
+from flightlink.api.app import create_app
+from flightlink.config import Settings
 
-
-@app.get("/hello/{name}")
-async def say_hello(name: str):
-    return {"message": f"Hello {name}"}
+_default_settings = Settings(data_dir=Path("./data"))
+app = create_app(settings=_default_settings)

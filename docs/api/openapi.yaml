@@ -1,0 +1,2184 @@
+openapi: 3.1.0
+info:
+  title: FlightLink ECS Backend API
+  version: 1.0.0
+  description: |
+    FlightLink ECS 1.0 控制面、实时观测与会话归档接口契约（`/api/v1`）。
+
+    ## 核心设计约束
+    - **职责隔离**：`flightlink-api` 不持有 `systemd` 或阿里云安全组写权限；服务启动、健康检查及任何 `GET` 请求绝不触发监听启动、日志采集或云端写同步。
+    - **异步写操作**：创建、修改、删除及动作接口均返回 `202 Accepted`（已受理，非已成功），通过 `GET /api/v1/operations/{operation_id}` 追踪步骤与最终结果。
+    - **身份与幂等**：所有 ID 均为不透明字符串；所有时间戳采用 UTC RFC 3339 格式（以 `Z` 结尾）；写接口支持 `Idempotency-Key`（同键不同载荷返回 `409 IDEMPOTENCY_CONFLICT`）与乐观并发版本检查（`If-Match` 或 `expected_config_version`，不匹配返回 `412 CONFIG_VERSION_MISMATCH`）。
+    - **遥测真实性**：12 项遥测指标无可靠来源时一律返回 `null`，不伪造默认值；地面站指令为只读观测。
+    - **归档独立与默认自动保存**：删除端口组完成后，`GET /api/v1/groups/{group_id}` 返回 `404`，而 `GET /api/v1/archive/groups/{group_id}` 仍返回 `200`（须鉴权）。`GET /api/v1/archive/changes` 仅返回**已封存**切片的元数据（不含文件正文）；文件经 `GET /api/v1/archive/sessions/{session_id}/files/{file_id}` 鉴权读取。本地保存状态由客户端根据实际写盘与 SHA-256 校验结果维护，ECS 绝不以 HTTP 200 推断“已保存到本地”。
+
+servers:
+  - url: https://{host}/api/v1
+    description: 生产管理入口（远程必须经由 HTTPS）
+    variables:
+      host:
+        default: flightlink.example.internal
+  - url: http://127.0.0.1:8000/api/v1
+    description: 本机管理监听默认入口
+
+tags:
+  - name: Health
+    description: 服务存活探针（严格只读，无副作用）
+  - name: Auth
+    description: 正式管理员/只读用户认证与令牌管理（禁用演示账号）
+  - name: Overview
+    description: ECS 总览、组件健康与容量水位
+  - name: Groups
+    description: 端口组查询与异步生命周期写操作（最多 5 组）
+  - name: Operations
+    description: 异步操作状态、步骤明细与安全重试
+  - name: Logs
+    description: 实时游标日志查询与显式诊断导出
+  - name: Archive
+    description: 历史会话归档浏览、增量清单、鉴权文件读取与兼容/CLI 导出
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: 服务健康检查
+      description: 轻量存活与数据库连接检查。绝不启动监听、采集或云同步。
+      security: []
+      responses:
+        "200":
+          description: 服务健康状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /auth/login:
+    post:
+      operationId: login
+      tags: [Auth]
+      summary: 账号密码登录
+      description: 正式版账号登录（不支持预览演示账号）。同时适用于网页端、桌面端与 Python 客户端。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+            example:
+              username: ops_admin
+              password: StrongPassword!2026
+      responses:
+        "200":
+          description: 登录成功，签发访问令牌与刷新令牌
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      tags: [Auth]
+      summary: 刷新访问令牌
+      description: 使用未过期的刷新令牌轮换新的访问令牌与刷新令牌。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshTokenRequest"
+      responses:
+        "200":
+          description: 令牌刷新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: 退出登录并撤销当前刷新令牌
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogoutRequest"
+      responses:
+        "204":
+          description: 已退出并撤销令牌
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [Auth]
+      summary: 获取当前已认证用户信息
+      responses:
+        "200":
+          description: 当前用户与权限角色
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /overview:
+    get:
+      operationId: getOverview
+      tags: [Overview]
+      summary: 获取总览、三组件状态、磁盘水位与端口组摘要
+      description: 严格只读，返回各状态观测时间 `observed_at` 与陈旧标记 `stale`。
+      responses:
+        "200":
+          description: 总览快照
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OverviewResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /groups:
+    get:
+      operationId: listGroups
+      tags: [Groups]
+      summary: 列出当前未完成删除的端口组
+      parameters:
+        - name: q
+          in: query
+          description: 按组名、端口号或 SYSID 模糊筛选
+          schema:
+            type: string
+            maxLength: 160
+        - name: filter
+          in: query
+          description: 状态筛选
+          schema:
+            type: string
+            enum: [all, online, idle, attention]
+            default: all
+      responses:
+        "200":
+          description: 端口组列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    post:
+      operationId: createGroup
+      tags: [Groups]
+      summary: 创建端口组（异步受理，落态“已配置、未启动”）
+      description: |
+        在单次数据库事务内检查 5 组上限、组名唯一性与双端口全局唯一性并完成端口预留，随后返回 `202 Accepted`。
+        需要 `admin` 角色。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGroupRequest"
+            example:
+              name: 一号机
+              dtu_port: 5760
+              gcs_protocol: tcp
+              gcs_port: 14552
+      responses:
+        "202":
+          description: 创建操作已受理（不代表已生效，需轮询操作状态）
+          headers:
+            Location:
+              description: 操作查询路径
+              schema:
+                type: string
+                example: /api/v1/operations/op_01JXYZ999
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /groups/{group_id}:
+    parameters:
+      - $ref: "#/components/parameters/GroupIdParam"
+
+    get:
+      operationId: getGroup
+      tags: [Groups]
+      summary: 获取端口组详情（含三项服务状态、12 项可空遥测与只读地面站指令）
+      description: 端口组删除完成后此接口返回 `404 GROUP_NOT_FOUND`，前端应据此引导或查询 `GET /api/v1/archive/groups/{group_id}`。
+      responses:
+        "200":
+          description: 端口组详情
+          headers:
+            ETag:
+              description: 当前生效配置版本标记（例如 `"v3"`）
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      operationId: updateGroup
+      tags: [Groups]
+      summary: 修改端口组名称、端口或地面站协议（异步受理或 dry-run 预演）
+      description: |
+        - 仅改名不重启通道。
+        - 停机组改端口不启动通道。
+        - 运行组改端口采用候选端口/规则准备后再短暂切换本组。
+        - 可通过 `If-Match` 请求头或请求体 `expected_config_version` 提供配置版本（不匹配返回 `412 CONFIG_VERSION_MISMATCH`）。
+        - 当 `dry_run=true` 时同步返回 `200 OK` 变更计划与校验结果，不写库、不触发外部动作。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/IfMatchHeader"
+        - name: dry_run
+          in: query
+          description: 设为 true 时仅校验并返回变更计划，不执行修改
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateGroupRequest"
+            example:
+              name: 一号机
+              gcs_protocol: udp
+              gcs_port: 14554
+              expected_config_version: 1
+      responses:
+        "200":
+          description: dry_run 预演结果（仅当 `dry_run=true`）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GroupUpdateDryRunResponse"
+        "202":
+          description: 修改操作已受理
+          headers:
+            Location:
+              description: 操作查询路径
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+    delete:
+      operationId: deleteGroup
+      tags: [Groups]
+      summary: 删除端口组（异步受理；保留未到期历史归档）
+      description: |
+        第一笔事务将组标记为 `deleting`、撤销启动意图并使旧操作代次失效。
+        停止本组进程并撤回自有安全组规则、核清归属后释放端口；另行封存活动会话切片（结束原因 `admin_group_deleted`）。
+        删除完成后 `/groups/{group_id}` 返回 404，`/archive/groups/{group_id}` 仍返回 200。
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/IfMatchHeader"
+      responses:
+        "202":
+          description: 删除操作已受理
+          headers:
+            Location:
+              description: 操作查询路径
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+
+  /groups/{group_id}/actions/{action}:
+    post:
+      operationId: triggerGroupAction
+      tags: [Groups]
+      summary: 触发端口组生命周期动作（start | stop | restart | sync-security-group | verify）
+      parameters:
+        - $ref: "#/components/parameters/GroupIdParam"
+        - name: action
+          in: path
+          required: true
+          description: 动作类型
+          schema:
+            type: string
+            enum: [start, stop, restart, sync-security-group, verify]
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/IfMatchHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GroupActionRequest"
+      responses:
+        "202":
+          description: 动作已受理
+          headers:
+            Location:
+              description: 操作查询路径
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /operations:
+    get:
+      operationId: listOperations
+      tags: [Operations]
+      summary: 查询最近异步操作记录
+      parameters:
+        - name: group_id
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/OperationStatus"
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: 操作分页列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /operations/{operation_id}:
+    parameters:
+      - $ref: "#/components/parameters/OperationIdParam"
+
+    get:
+      operationId: getOperation
+      tags: [Operations]
+      summary: 查询单个异步操作状态与步骤明细
+      responses:
+        "200":
+          description: 操作详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /operations/{operation_id}/retry:
+    post:
+      operationId: retryOperation
+      tags: [Operations]
+      summary: 重试可重试的失败或待核实操作
+      description: 仅 `admin` 可调用。对 `delete` / `cleanup_pending` 操作仅继续清理，绝不恢复为运行态。
+      parameters:
+        - $ref: "#/components/parameters/OperationIdParam"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      responses:
+        "202":
+          description: 重试操作已受理
+          headers:
+            Location:
+              description: 新/续接操作查询路径
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationAcceptedResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /logs:
+    get:
+      operationId: queryLiveLogs
+      tags: [Logs]
+      summary: 按组、来源、级别、关键词与游标读取实时日志
+      description: "无新日志时返回 `items: []` 的空页。清屏与暂停滚动均为客户端本地行为。"
+      parameters:
+        - name: group_id
+          in: query
+          description: 端口组 ID；省略时返回全部活动组日志
+          schema:
+            type: string
+        - name: source
+          in: query
+          schema:
+            type: string
+            enum: [all, router, mavproxy]
+            default: all
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [all, DEBUG, INFO, WARN, ERROR]
+            default: all
+        - name: q
+          in: query
+          description: 日志正文子串过滤
+          schema:
+            type: string
+            maxLength: 160
+        - name: cursor
+          in: query
+          description: 上次响应返回的 `next_cursor`
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        "200":
+          description: 实时日志分页结果
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveLogPageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /logs/export:
+    get:
+      operationId: exportLiveLogs
+      tags: [Logs]
+      summary: 显式导出实时日志文本（CLI / 排障专用）
+      description: 显式导出入口，供命令行或排障使用；桌面端正常流程不提供常规导出按钮。
+      parameters:
+        - name: group_id
+          in: query
+          schema:
+            type: string
+        - name: source
+          in: query
+          schema:
+            type: string
+            enum: [all, router, mavproxy]
+            default: all
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [all, DEBUG, INFO, WARN, ERROR]
+            default: all
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 160
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 1000
+      responses:
+        "200":
+          description: UTF-8 纯文本日志导出流
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /archive/groups:
+    get:
+      operationId: listArchiveGroups
+      tags: [Archive]
+      summary: 列出历史归档端口组（含活动空态组与已删组）
+      description: 归档独立于运行组，须鉴权；不返回日志正文，不触发任何采集。
+      parameters:
+        - name: include_deleted
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: 归档端口组列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveGroupListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /archive/groups/{group_id}:
+    get:
+      operationId: getArchiveGroup
+      tags: [Archive]
+      summary: 获取指定端口组的归档元数据（已删组仍返回 200）
+      parameters:
+        - $ref: "#/components/parameters/GroupIdParam"
+      responses:
+        "200":
+          description: 归档组元数据与最近切片摘要
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveGroupSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /archive/groups/{group_id}/sessions:
+    get:
+      operationId: listArchiveGroupSessions
+      tags: [Archive]
+      summary: 分页列出某端口组的会话切片元数据（不含正文）
+      parameters:
+        - $ref: "#/components/parameters/GroupIdParam"
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [all, active, sealed]
+            default: all
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 30
+      responses:
+        "200":
+          description: 切片元数据分页列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveSessionListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /archive/sessions/{session_id}:
+    get:
+      operationId: getArchiveSession
+      tags: [Archive]
+      summary: 获取单个会话切片元数据、来源可用性、缺口与文件清单（不含正文）
+      parameters:
+        - $ref: "#/components/parameters/SessionIdParam"
+      responses:
+        "200":
+          description: 会话切片元数据详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveSessionDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+
+  /archive/sessions/{session_id}/entries:
+    get:
+      operationId: getArchiveSessionEntries
+      tags: [Archive]
+      summary: 分页浏览会话切片单源日志正文
+      parameters:
+        - $ref: "#/components/parameters/SessionIdParam"
+        - name: source
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [router, mavproxy]
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [all, DEBUG, INFO, WARN, ERROR]
+            default: all
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 160
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 200
+      responses:
+        "200":
+          description: 切片日志正文分页
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveEntryPageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /archive/changes:
+    get:
+      operationId: listArchiveChanges
+      tags: [Archive]
+      summary: 归档增量同步清单（仅列出已封存切片元数据）
+      description: |
+        供未来 Python 桌面端自动保存与本地同步客户端轮询。
+        - **仅返回已封存（`sealed`）切片**，绝不返回进行中切片，绝不携带文件正文，绝不触发采集。
+        - 每条记录提供稳定的 `ecs_instance_id`、`group_id`、`session_id` 以及 `router`/`mavproxy`/`metadata` 三类文件的 `file_id`、`size_bytes`、`sha256`、`expires_at` 和来源缺口（`availability` / `missing_reason`）。
+        - 客户端必须**先将发现的待下载任务持久化到本地队列，再推进 `next_cursor`**，以保证单切片失败不阻塞后续切片且不丢单。
+        - 若客户端离线超过保留期导致游标失效，服务端返回 `410 CURSOR_EXPIRED`，客户端须记录留存窗缺口并以空游标重新对账。
+      parameters:
+        - name: cursor
+          in: query
+          description: 上次同步保存的 `next_cursor`；首次同步或游标失效重新对账时留空
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: 已封存切片增量清单
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArchiveChangesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /archive/sessions/{session_id}/files/{file_id}:
+    get:
+      operationId: readArchiveSessionFile
+      tags: [Archive]
+      summary: 鉴权读取已封存切片的单个归档文件（自动保存与手动补下载主接口）
+      description: |
+        桌面端默认自动保存与失败后「重新下载日志」共用此接口按文件粒度拉取 `router`、`mavproxy` 或 `metadata`。
+        - 服务端返回文件字节流及 `X-Content-SHA256`、`Content-Length`、`X-Archive-Expires-At`。
+        - **服务端绝不以 HTTP 200 推断客户端已保存到本地**；保存状态仅由客户端在临时文件校验通过并原子改名后于本地维护。
+        - 若云端已超过 7×24h 保留期，返回 `410 ARCHIVE_EXPIRED`（客户端应报告过期，不得循环重试）。
+        - 若云端本身缺少该路日志，清单中已标记 `missing_on_server`，直接访问返回 `404 ARCHIVE_SOURCE_MISSING`。
+      parameters:
+        - $ref: "#/components/parameters/SessionIdParam"
+        - $ref: "#/components/parameters/FileIdParam"
+      responses:
+        "200":
+          description: 归档文件字节流
+          headers:
+            ETag:
+              description: 基于 SHA-256 的强校验标签
+              schema:
+                type: string
+            X-Content-SHA256:
+              description: 文件内容十六进制 SHA-256 校验值
+              schema:
+                type: string
+            X-Archive-Session-Id:
+              schema:
+                type: string
+            X-Archive-File-Id:
+              schema:
+                type: string
+            X-Archive-Source:
+              schema:
+                type: string
+                enum: [router, mavproxy, metadata]
+            X-Archive-Expires-At:
+              schema:
+                type: string
+                format: date-time
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+
+  /archive/sessions/{session_id}/download:
+    get:
+      operationId: downloadArchiveSession
+      tags: [Archive]
+      summary: 按来源下载切片文件或打包归档（CLI 与兼容用途，非桌面端常规按钮）
+      description: |
+        支持 `source=router|mavproxy|metadata|all`：
+        - `router` / `mavproxy` 返回 UTF-8 日志文本；
+        - `metadata` 返回 JSON 元数据；
+        - `all` 返回包含可用文件与 `metadata.json` 的 `.tar.gz` 归档包。
+        仅供 `flightlink history export` CLI 或兼容调用使用；未来桌面端正常流程通过 `/archive/changes` + `/archive/sessions/{session_id}/files/{file_id}` 自动保存，不展示常规下载/来源选择按钮。
+      parameters:
+        - $ref: "#/components/parameters/SessionIdParam"
+        - name: source
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [router, mavproxy, metadata, all]
+      responses:
+        "200":
+          description: 单源日志或合并归档流
+          headers:
+            X-Content-SHA256:
+              schema:
+                type: string
+            X-Archive-Expires-At:
+              schema:
+                type: string
+                format: date-time
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: string
+                format: binary
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        统一使用 `Authorization: Bearer <token>`：
+        - 网页端 / 桌面端：经 `POST /api/v1/auth/login` 获取的短期 JWT Access Token（配合 Refresh Token 续期）。
+        - 无界面 Python 同步客户端：既可使用登录令牌，也可使用管理员经 CLI 签发的可吊销服务令牌（`flk_...`，可授予只读 `viewer` 权限）。
+
+  parameters:
+    GroupIdParam:
+      name: group_id
+      in: path
+      required: true
+      description: 不可变端口组不透明 ID
+      schema:
+        type: string
+        example: grp_01JXYZ001
+    OperationIdParam:
+      name: operation_id
+      in: path
+      required: true
+      description: 异步操作不透明 ID
+      schema:
+        type: string
+        example: op_01JXYZ999
+    SessionIdParam:
+      name: session_id
+      in: path
+      required: true
+      description: 会话切片不透明 ID
+      schema:
+        type: string
+        example: sess_01JXYZ100
+    FileIdParam:
+      name: file_id
+      in: path
+      required: true
+      description: 切片内稳定文件不透明 ID
+      schema:
+        type: string
+        example: file_01JXYZ100_router
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        客户端生成的幂等键（推荐 UUIDv4，长度 8–128）。
+        相同方法、路径与载荷重复提交返回同一已受理操作；相同幂等键更换请求内容必须返回 `409 IDEMPOTENCY_CONFLICT`。
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    IfMatchHeader:
+      name: If-Match
+      in: header
+      required: false
+      description: 乐观并发版本检查头，接受 `"v<N>"` 或 `<N>`（如 `"v3"`）。不匹配返回 `412 CONFIG_VERSION_MISMATCH`。
+      schema:
+        type: string
+        example: '"v3"'
+
+  responses:
+    Unauthorized:
+      description: 未认证、凭据错误或令牌已过期/失效
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: TOKEN_EXPIRED
+              message: Access token has expired. Refresh token or login again.
+              retryable: false
+              details: []
+              request_id: req_01JABC001
+    Forbidden:
+      description: 已认证但当前角色无权执行该操作
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: INSUFFICIENT_ROLE
+              message: Admin role is required for write operations.
+              retryable: false
+              details: []
+              request_id: req_01JABC002
+    NotFound:
+      description: 资源不存在（含已删除的运行端口组或云端本身缺失的日志源）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            groupNotFound:
+              summary: 端口组不存在或已完成删除
+              value:
+                error:
+                  code: GROUP_NOT_FOUND
+                  message: Port group does not exist or has been deleted.
+                  retryable: false
+                  details: []
+                  request_id: req_01JABC003
+            sourceMissing:
+              summary: 云端本身缺少该路日志
+              value:
+                error:
+                  code: ARCHIVE_SOURCE_MISSING
+                  message: Cloud archive does not contain a mavproxy log file for this session.
+                  retryable: false
+                  details:
+                    - field: source
+                      message: mavproxy_not_running
+                  request_id: req_01JABC004
+    Conflict:
+      description: 业务状态冲突、端口/组名冲突、达到五组上限或幂等键载荷冲突
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            portConflict:
+              summary: 端口跨组冲突
+              value:
+                error:
+                  code: PORT_CONFLICT
+                  message: Port 5760 is already reserved by another port group.
+                  retryable: false
+                  details:
+                    - field: dtu_port
+                      message: Port 5760 is already in use
+                  request_id: req_01JABC005
+            idempotencyConflict:
+              summary: 同一幂等键更换请求内容
+              value:
+                error:
+                  code: IDEMPOTENCY_CONFLICT
+                  message: Idempotency-Key was already used with a different request payload.
+                  retryable: false
+                  details: []
+                  request_id: req_01JABC006
+    Gone:
+      description: 归档切片已超过 7×24h 保留期，或增量同步游标已失效需要重新对账
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          examples:
+            archiveExpired:
+              summary: 云端归档文件已过期清理
+              value:
+                error:
+                  code: ARCHIVE_EXPIRED
+                  message: Archive session has exceeded the 7-day cloud retention window and is no longer available.
+                  retryable: false
+                  details:
+                    - field: session_id
+                      message: expired_at=2026-11-19T08:00:00Z
+                  request_id: req_01JABC007
+            cursorExpired:
+              summary: 同步游标已失效
+              value:
+                error:
+                  code: CURSOR_EXPIRED
+                  message: Sync cursor is older than the retained archive horizon; record a potential retention gap and reconcile from an empty cursor.
+                  retryable: false
+                  details:
+                    - field: cursor
+                      message: reconcile_required=true
+                  request_id: req_01JABC008
+    PreconditionFailed:
+      description: 配置版本不匹配（数据过期）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: CONFIG_VERSION_MISMATCH
+              message: Group configuration version has changed; refresh group details before retrying.
+              retryable: false
+              details:
+                - field: config_version
+                  message: expected=1, current=2
+              request_id: req_01JABC009
+    ValidationError:
+      description: 请求参数校验失败
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed.
+              retryable: false
+              details:
+                - field: gcs_port
+                  message: gcs_port must differ from dtu_port
+              request_id: req_01JABC010
+
+  schemas:
+    ErrorDetail:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+        message:
+          type: string
+
+    ErrorBody:
+      type: object
+      required: [code, message, retryable, request_id]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+        details:
+          type: array
+          items:
+            $ref: "#/components/schemas/ErrorDetail"
+          default: []
+        request_id:
+          type: string
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+
+    HealthResponse:
+      type: object
+      required: [status, version, ecs_instance_id, observed_at, db_ok]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        ecs_instance_id:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+        db_ok:
+          type: boolean
+
+    UserRole:
+      type: string
+      enum: [admin, viewer]
+
+    UserProfile:
+      type: object
+      required: [user_id, username, display_name, role, created_at]
+      properties:
+        user_id:
+          type: string
+        username:
+          type: string
+        display_name:
+          type: string
+        role:
+          $ref: "#/components/schemas/UserRole"
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: ["string", "null"]
+          format: date-time
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 64
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 16
+
+    LogoutRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: ["string", "null"]
+
+    TokenResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_at, refresh_expires_at, user]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          const: bearer
+        expires_at:
+          type: string
+          format: date-time
+        refresh_expires_at:
+          type: string
+          format: date-time
+        user:
+          $ref: "#/components/schemas/UserProfile"
+
+    ComponentHealth:
+      type: object
+      required: [name, status, observed_at, stale]
+      properties:
+        name:
+          type: string
+          enum: [flightlink-api, flightlink-agent, flightlink-archive]
+        status:
+          type: string
+          enum: [ok, degraded, stopped, unknown]
+        observed_at:
+          type: ["string", "null"]
+          format: date-time
+        stale:
+          type: boolean
+        detail:
+          type: ["string", "null"]
+
+    DiskQuotaStatus:
+      type: object
+      required: [archive_dir, status, observed_at]
+      properties:
+        archive_dir:
+          type: string
+          description: ECS 服务端归档目录（仅供运维展示，绝不作为客户端本地保存路径）
+        status:
+          type: string
+          enum: [ok, warning, degraded_quota_exceeded]
+        total_bytes:
+          type: ["integer", "null"]
+        free_bytes:
+          type: ["integer", "null"]
+        archive_used_bytes:
+          type: ["integer", "null"]
+        observed_at:
+          type: string
+          format: date-time
+
+    OverviewMetrics:
+      type: object
+      required: [group_count, max_groups, running_router_count, online_fc_count, needs_verification_count]
+      properties:
+        group_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+        max_groups:
+          type: integer
+          const: 5
+        running_router_count:
+          type: integer
+        online_fc_count:
+          type: integer
+        needs_verification_count:
+          type: integer
+
+    OverviewResponse:
+      type: object
+      required: [ecs_instance_id, observed_at, stale, stale_after_seconds, components, metrics, disk, groups]
+      properties:
+        ecs_instance_id:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+        stale:
+          type: boolean
+        stale_after_seconds:
+          type: integer
+        components:
+          type: array
+          items:
+            $ref: "#/components/schemas/ComponentHealth"
+        metrics:
+          $ref: "#/components/schemas/OverviewMetrics"
+        disk:
+          $ref: "#/components/schemas/DiskQuotaStatus"
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/GroupSummary"
+
+    GcsProtocol:
+      type: string
+      enum: [tcp, udp]
+
+    DesiredState:
+      type: string
+      enum: [stopped, running, deleting]
+
+    GroupLifecycleState:
+      type: string
+      enum:
+        - configured_stopped
+        - starting
+        - running
+        - stopping
+        - updating
+        - deleting
+        - cleanup_pending
+        - needs_verification
+        - error
+
+    RouterServiceStatus:
+      type: object
+      required: [state, verified_listening, observed_at, stale]
+      properties:
+        state:
+          type: string
+          enum: [stopped, starting, running, error, needs_verification]
+        unit_name:
+          type: ["string", "null"]
+        pid:
+          type: ["integer", "null"]
+        uptime_seconds:
+          type: ["integer", "null"]
+        bound_endpoints:
+          type: array
+          items:
+            type: string
+          default: []
+        verified_listening:
+          type: boolean
+        observed_at:
+          type: ["string", "null"]
+          format: date-time
+        stale:
+          type: boolean
+        detail:
+          type: ["string", "null"]
+
+    MavproxyServiceStatus:
+      type: object
+      required: [state, observed_at, stale]
+      properties:
+        state:
+          type: string
+          enum: [disconnected, waiting, connected, error]
+        unit_name:
+          type: ["string", "null"]
+        pid:
+          type: ["integer", "null"]
+        uptime_seconds:
+          type: ["integer", "null"]
+        observed_at:
+          type: ["string", "null"]
+          format: date-time
+        stale:
+          type: boolean
+        detail:
+          type: ["string", "null"]
+
+    SecurityGroupRuleView:
+      type: object
+      required: [role, protocol, port, source_cidr, status]
+      properties:
+        rule_id:
+          type: ["string", "null"]
+        role:
+          type: string
+          enum: [dtu, gcs]
+        protocol:
+          type: string
+          enum: [udp, tcp]
+        port:
+          type: integer
+        source_cidr:
+          type: string
+        status:
+          type: string
+          enum: [present, pending_create, pending_delete, drift, unknown]
+
+    SecurityGroupServiceStatus:
+      type: object
+      required: [state, owned_rule_count, observed_at, stale]
+      properties:
+        state:
+          type: string
+          enum: [synced, syncing, drift, needs_verification, unconfigured, error]
+        security_group_id:
+          type: ["string", "null"]
+        owned_rule_count:
+          type: integer
+        rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/SecurityGroupRuleView"
+          default: []
+        observed_at:
+          type: ["string", "null"]
+          format: date-time
+        stale:
+          type: boolean
+        detail:
+          type: ["string", "null"]
+
+    GroupSummary:
+      type: object
+      required:
+        - group_id
+        - name
+        - dtu_protocol
+        - dtu_port
+        - gcs_protocol
+        - gcs_port
+        - config_version
+        - desired_state
+        - lifecycle_state
+        - operation_generation
+        - router
+        - mavproxy
+        - security_group
+        - fc_state
+        - gcs_state
+        - observed_at
+        - stale
+      properties:
+        group_id:
+          type: string
+        name:
+          type: string
+        dtu_protocol:
+          type: string
+          const: udp
+        dtu_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        gcs_protocol:
+          $ref: "#/components/schemas/GcsProtocol"
+        gcs_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        config_version:
+          type: integer
+          minimum: 1
+        candidate_version:
+          type: ["integer", "null"]
+        desired_state:
+          $ref: "#/components/schemas/DesiredState"
+        lifecycle_state:
+          $ref: "#/components/schemas/GroupLifecycleState"
+        operation_generation:
+          type: integer
+          minimum: 1
+        active_operation_id:
+          type: ["string", "null"]
+        verification_reason:
+          type: ["string", "null"]
+        sysid:
+          type: ["integer", "null"]
+          description: 仅从真实飞控 MAVLink 消息观测得到；无真实飞控消息时为 null
+        fc_state:
+          type: string
+          enum: [offline, online]
+        dtu_peer:
+          type: ["string", "null"]
+        gcs_state:
+          type: string
+          enum: [disconnected, idle, connected]
+        gcs_peer:
+          type: ["string", "null"]
+        link_quality_pct:
+          type: ["integer", "null"]
+          minimum: 0
+          maximum: 100
+        rtt_ms:
+          type: ["integer", "null"]
+          minimum: 0
+        last_activity_at:
+          type: ["string", "null"]
+          format: date-time
+        router:
+          $ref: "#/components/schemas/RouterServiceStatus"
+        mavproxy:
+          $ref: "#/components/schemas/MavproxyServiceStatus"
+        security_group:
+          $ref: "#/components/schemas/SecurityGroupServiceStatus"
+        observed_at:
+          type: string
+          format: date-time
+        stale:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TelemetrySnapshot:
+      type: object
+      description: 12 项遥测指标；任何无可靠真实来源的字段必须返回 null，绝不制造假值。
+      required:
+        - flight_mode
+        - armed
+        - battery_remaining_pct
+        - battery_voltage_v
+        - gps_satellites
+        - gps_fix_type
+        - gps_hdop
+        - altitude_msl_m
+        - relative_altitude_m
+        - ground_speed_mps
+        - rx_rate_kbps
+        - tx_rate_kbps
+        - packets_lost
+        - packets_received
+        - packet_loss_pct
+        - observed_at
+        - stale
+      properties:
+        flight_mode:
+          type: ["string", "null"]
+        armed:
+          type: ["boolean", "null"]
+        battery_remaining_pct:
+          type: ["number", "null"]
+        battery_voltage_v:
+          type: ["number", "null"]
+        gps_satellites:
+          type: ["integer", "null"]
+        gps_fix_type:
+          type: ["string", "null"]
+        gps_hdop:
+          type: ["number", "null"]
+        altitude_msl_m:
+          type: ["number", "null"]
+        relative_altitude_m:
+          type: ["number", "null"]
+        ground_speed_mps:
+          type: ["number", "null"]
+        rx_rate_kbps:
+          type: ["number", "null"]
+        tx_rate_kbps:
+          type: ["number", "null"]
+        packets_lost:
+          type: ["integer", "null"]
+        packets_received:
+          type: ["integer", "null"]
+        packet_loss_pct:
+          type: ["number", "null"]
+        observed_at:
+          type: ["string", "null"]
+          format: date-time
+        stale:
+          type: boolean
+
+    ObservedGcsCommand:
+      type: object
+      description: 旁路观测到的地面站指令（严格只读，不可由管理端下发）。
+      required: [id, observed_at, command, status]
+      properties:
+        id:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+        command:
+          type: string
+        detail:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [ACCEPTED, DENIED, UNSUPPORTED, FAILED, IN_PROGRESS, UNKNOWN]
+        source_sysid:
+          type: ["integer", "null"]
+        source_compid:
+          type: ["integer", "null"]
+        source_label:
+          type: ["string", "null"]
+
+    GroupDetail:
+      allOf:
+        - $ref: "#/components/schemas/GroupSummary"
+        - type: object
+          required: [telemetry, recent_gcs_commands]
+          properties:
+            telemetry:
+              $ref: "#/components/schemas/TelemetrySnapshot"
+            recent_gcs_commands:
+              type: array
+              items:
+                $ref: "#/components/schemas/ObservedGcsCommand"
+
+    GroupListResponse:
+      type: object
+      required: [items, total, max_groups, observed_at]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/GroupSummary"
+        total:
+          type: integer
+        max_groups:
+          type: integer
+          const: 5
+        observed_at:
+          type: string
+          format: date-time
+
+    CreateGroupRequest:
+      type: object
+      required: [name, dtu_port, gcs_protocol, gcs_port]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 24
+        dtu_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        gcs_protocol:
+          $ref: "#/components/schemas/GcsProtocol"
+        gcs_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+
+    UpdateGroupRequest:
+      type: object
+      properties:
+        name:
+          type: ["string", "null"]
+          minLength: 1
+          maxLength: 24
+        dtu_port:
+          type: ["integer", "null"]
+          minimum: 1
+          maximum: 65535
+        gcs_protocol:
+          oneOf:
+            - $ref: "#/components/schemas/GcsProtocol"
+            - type: "null"
+        gcs_port:
+          type: ["integer", "null"]
+          minimum: 1
+          maximum: 65535
+        expected_config_version:
+          type: ["integer", "null"]
+          minimum: 1
+
+    GroupUpdateDryRunResponse:
+      type: object
+      required: [group_id, valid, requires_restart, requires_sg_sync, planned_steps, diff]
+      properties:
+        group_id:
+          type: string
+        valid:
+          type: boolean
+        requires_restart:
+          type: boolean
+        requires_sg_sync:
+          type: boolean
+        planned_steps:
+          type: array
+          items:
+            type: string
+        diff:
+          type: object
+          additionalProperties: true
+
+    GroupActionRequest:
+      type: object
+      properties:
+        expected_config_version:
+          type: ["integer", "null"]
+          minimum: 1
+
+    OperationAction:
+      type: string
+      enum:
+        - create
+        - update
+        - delete
+        - start
+        - stop
+        - restart
+        - sync_security_group
+        - verify
+
+    OperationStatus:
+      type: string
+      enum:
+        - pending
+        - running
+        - succeeded
+        - failed
+        - needs_verification
+        - cancelled
+
+    OperationStep:
+      type: object
+      required: [step_name, status]
+      properties:
+        step_name:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, needs_verification, skipped]
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+        finished_at:
+          type: ["string", "null"]
+          format: date-time
+        detail:
+          type: ["string", "null"]
+        error_code:
+          type: ["string", "null"]
+        error_message:
+          type: ["string", "null"]
+
+    OperationDetail:
+      type: object
+      required:
+        - operation_id
+        - group_id
+        - action
+        - status
+        - generation
+        - retryable
+        - steps
+        - created_at
+        - updated_at
+      properties:
+        operation_id:
+          type: string
+        group_id:
+          type: string
+        action:
+          $ref: "#/components/schemas/OperationAction"
+        status:
+          $ref: "#/components/schemas/OperationStatus"
+        generation:
+          type: integer
+        idempotency_key:
+          type: ["string", "null"]
+        requested_by:
+          type: string
+        retryable:
+          type: boolean
+        retry_hint:
+          type: ["string", "null"]
+        error_code:
+          type: ["string", "null"]
+        error_message:
+          type: ["string", "null"]
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/OperationStep"
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+        finished_at:
+          type: ["string", "null"]
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OperationAcceptedResponse:
+      type: object
+      required: [operation]
+      properties:
+        operation:
+          $ref: "#/components/schemas/OperationDetail"
+
+    OperationListResponse:
+      type: object
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OperationDetail"
+        next_cursor:
+          type: ["string", "null"]
+        has_more:
+          type: boolean
+
+    LogEntry:
+      type: object
+      required: [event_id, group_id, source, level, ts, text]
+      properties:
+        event_id:
+          type: string
+        group_id:
+          type: string
+        source:
+          type: string
+          enum: [router, mavproxy]
+        level:
+          type: string
+          enum: [DEBUG, INFO, WARN, ERROR]
+        ts:
+          type: string
+          format: date-time
+        text:
+          type: string
+
+    LiveLogPageResponse:
+      type: object
+      required: [items, next_cursor, has_more, observed_at]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        next_cursor:
+          type: ["string", "null"]
+        has_more:
+          type: boolean
+        observed_at:
+          type: string
+          format: date-time
+
+    ArchiveSourceKind:
+      type: string
+      enum: [router, mavproxy, metadata]
+
+    ArchiveSourceAvailability:
+      type: string
+      enum:
+        - available
+        - missing_on_server
+        - empty
+        - degraded_quota_exceeded
+        - in_progress
+
+    SessionCloseReason:
+      type: string
+      enum:
+        - fc_heartbeat_timeout
+        - admin_group_deleted
+        - admin_group_stopped
+        - port_reconfigured
+        - service_shutdown
+        - recovery_closed
+
+    ArchiveGap:
+      type: object
+      required: [source, started_at, reason]
+      properties:
+        source:
+          type: string
+          enum: [router, mavproxy, all]
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: ["string", "null"]
+          format: date-time
+        reason:
+          type: string
+          enum: [observer_disconnected, archive_restarted, disk_quota_exceeded, journal_gap]
+        detail:
+          type: ["string", "null"]
+
+    ArchiveArtifactDescriptor:
+      type: object
+      required: [source, availability, logical_name, content_type]
+      properties:
+        source:
+          $ref: "#/components/schemas/ArchiveSourceKind"
+        availability:
+          $ref: "#/components/schemas/ArchiveSourceAvailability"
+        file_id:
+          type: ["string", "null"]
+        logical_name:
+          type: string
+        content_type:
+          type: string
+        size_bytes:
+          type: ["integer", "null"]
+          minimum: 0
+        sha256:
+          type: ["string", "null"]
+        line_count:
+          type: ["integer", "null"]
+          minimum: 0
+        missing_reason:
+          type: ["string", "null"]
+        read_url:
+          type: ["string", "null"]
+
+    ArchiveSessionSummary:
+      type: object
+      required:
+        - ecs_instance_id
+        - session_id
+        - group_id
+        - group_name_snapshot
+        - status
+        - first_observed_at
+        - last_heartbeat_at
+        - has_gaps
+        - has_missing_sources
+        - files
+      properties:
+        ecs_instance_id:
+          type: string
+        session_id:
+          type: string
+        group_id:
+          type: string
+        group_name_snapshot:
+          type: string
+        dtu_port_snapshot:
+          type: integer
+        gcs_protocol_snapshot:
+          $ref: "#/components/schemas/GcsProtocol"
+        gcs_port_snapshot:
+          type: integer
+        group_deleted:
+          type: boolean
+        status:
+          type: string
+          enum: [active, sealing, sealed]
+        sysid:
+          type: ["integer", "null"]
+        first_observed_at:
+          type: string
+          format: date-time
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: ["string", "null"]
+          format: date-time
+        sealed_at:
+          type: ["string", "null"]
+          format: date-time
+        expires_at:
+          type: ["string", "null"]
+          format: date-time
+        close_reason:
+          oneOf:
+            - $ref: "#/components/schemas/SessionCloseReason"
+            - type: "null"
+        has_gaps:
+          type: boolean
+        has_missing_sources:
+          type: boolean
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveArtifactDescriptor"
+
+    ArchiveSessionDetail:
+      allOf:
+        - $ref: "#/components/schemas/ArchiveSessionSummary"
+        - type: object
+          required: [gaps]
+          properties:
+            gaps:
+              type: array
+              items:
+                $ref: "#/components/schemas/ArchiveGap"
+
+    ArchiveGroupSummary:
+      type: object
+      required:
+        - group_id
+        - name_snapshot
+        - dtu_protocol
+        - dtu_port_snapshot
+        - gcs_protocol_snapshot
+        - gcs_port_snapshot
+        - deleted
+        - active_session_count
+        - sealed_session_count
+      properties:
+        group_id:
+          type: string
+        name_snapshot:
+          type: string
+        dtu_protocol:
+          type: string
+          const: udp
+        dtu_port_snapshot:
+          type: integer
+        gcs_protocol_snapshot:
+          $ref: "#/components/schemas/GcsProtocol"
+        gcs_port_snapshot:
+          type: integer
+        deleted:
+          type: boolean
+        deleted_at:
+          type: ["string", "null"]
+          format: date-time
+        active_session_count:
+          type: integer
+        sealed_session_count:
+          type: integer
+        latest_session:
+          oneOf:
+            - $ref: "#/components/schemas/ArchiveSessionSummary"
+            - type: "null"
+
+    ArchiveGroupListResponse:
+      type: object
+      required: [ecs_instance_id, items, observed_at]
+      properties:
+        ecs_instance_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveGroupSummary"
+        observed_at:
+          type: string
+          format: date-time
+
+    ArchiveSessionListResponse:
+      type: object
+      required: [group_id, items, next_cursor, has_more]
+      properties:
+        group_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveSessionSummary"
+        next_cursor:
+          type: ["string", "null"]
+        has_more:
+          type: boolean
+
+    ArchiveEntryPageResponse:
+      type: object
+      required: [session_id, source, source_availability, items, gaps, next_cursor, has_more]
+      properties:
+        session_id:
+          type: string
+        source:
+          type: string
+          enum: [router, mavproxy]
+        source_availability:
+          $ref: "#/components/schemas/ArchiveSourceAvailability"
+        missing_reason:
+          type: ["string", "null"]
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        gaps:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveGap"
+        next_cursor:
+          type: ["string", "null"]
+        has_more:
+          type: boolean
+
+    ArchiveChangeItem:
+      type: object
+      required:
+        - change_seq
+        - ecs_instance_id
+        - group_id
+        - group_name_snapshot
+        - group_deleted
+        - session_id
+        - first_observed_at
+        - last_heartbeat_at
+        - ended_at
+        - sealed_at
+        - expires_at
+        - close_reason
+        - files
+        - gaps
+      properties:
+        change_seq:
+          type: integer
+          minimum: 1
+        ecs_instance_id:
+          type: string
+        group_id:
+          type: string
+        group_name_snapshot:
+          type: string
+        dtu_port_snapshot:
+          type: integer
+        gcs_protocol_snapshot:
+          $ref: "#/components/schemas/GcsProtocol"
+        gcs_port_snapshot:
+          type: integer
+        group_deleted:
+          type: boolean
+        session_id:
+          type: string
+        sysid:
+          type: ["integer", "null"]
+        first_observed_at:
+          type: string
+          format: date-time
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+        sealed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        close_reason:
+          $ref: "#/components/schemas/SessionCloseReason"
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveArtifactDescriptor"
+        gaps:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveGap"
+
+    ArchiveChangesResponse:
+      type: object
+      required:
+        - ecs_instance_id
+        - retention_seconds
+        - items
+        - next_cursor
+        - has_more
+        - observed_at
+      properties:
+        ecs_instance_id:
+          type: string
+        retention_seconds:
+          type: integer
+          example: 604800
+        oldest_available_sealed_at:
+          type: ["string", "null"]
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArchiveChangeItem"
+        next_cursor:
+          type: ["string", "null"]
+        has_more:
+          type: boolean
+        observed_at:
+          type: string
+          format: date-time

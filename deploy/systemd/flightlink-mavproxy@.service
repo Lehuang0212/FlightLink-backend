@@ -1,0 +1,20 @@
+[Unit]
+Description=FlightLink Passive Bypass MAVProxy Observer (%i)
+After=flightlink-router@%i.service
+PartOf=flightlink-router@%i.service
+# Passive loopback observer only; never blocks or sits inline in DTU <-> GCS forwarding.
+
+[Service]
+Type=simple
+User=flightlink-archive
+Group=flightlink
+EnvironmentFile=-/var/lib/flightlink/run/mavproxy-%i.env
+ExecStart=/opt/flightlink/venv/bin/mavproxy.py --master=${INTERNAL_TAP_ENDPOINT} --daemon --non-interactive --no-state --target-system=0
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flightlink-mavproxy-%i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
