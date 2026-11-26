@@ -43,7 +43,6 @@ def render_router_config(
         f"TcpServerPort = {tcp_server_port}",
         "ReportStats = false",
         "MavlinkDialect = auto",
-        "LogMode = disabled",
         "",
         "[UdpEndpoint dtu]",
         "Mode = Server",
@@ -98,6 +97,10 @@ def write_router_config_atomic(
         fh.write(content)
         fh.flush()
         os.fsync(fh.fileno())
+    try:
+        os.chmod(tmp, 0o644)
+    except OSError:
+        pass
     os.replace(tmp, target)
     return target
 

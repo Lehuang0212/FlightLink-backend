@@ -158,7 +158,11 @@ def test_cli_init_system_provisioning_and_db_cidr_fallback(tmp_path: Path) -> No
     assert "FLIGHTLINK_JWT_SECRET=" in env_text
     assert 'FLIGHTLINK_DTU_ALLOWED_CIDRS=["0.0.0.0/0"]' in env_text
     assert (systemd_dir / "flightlink-api.service").exists()
-    assert "UMask=0007" in (systemd_dir / "flightlink-api.service").read_text(encoding="utf-8")
+    api_unit = (systemd_dir / "flightlink-api.service").read_text(encoding="utf-8")
+    assert "UMask=0007" in api_unit
+    # ExecStart must point to the active venv (sys.prefix), never a dereferenced /usr/bin symlink!
+    import sys
+    assert str(Path(sys.prefix)) in api_unit
     assert "Restart=no" in (systemd_dir / "flightlink-router@.service").read_text(encoding="utf-8")
     assert polkit_rule.exists()
     assert "flightlink-router@" in polkit_rule.read_text(encoding="utf-8")
@@ -178,6 +182,25 @@ def test_cli_init_system_provisioning_and_db_cidr_fallback(tmp_path: Path) -> No
     assert r_conn.exit_code == 0, r_conn.output
     assert json.loads(r_conn.output)["ram_role"] == "MyCustomRole"
     assert "FLIGHTLINK_ALIYUN_RAM_ROLE_NAME=MyCustomRole" in env_file.read_text(encoding="utf-8")
+
+    # Re-running `flightlink init --system` without --admin-user re-renders units while preserving secrets & SG config!
+    secret_before = [line for line in env_file.read_text(encoding="utf-8").splitlines() if line.startswith("FLIGHTLINK_JWT_SECRET=")][0]
+    r_reinit = runner.invoke(
+        cli,
+        [
+            "init",
+            "--system",
+            "--env-file", str(env_file),
+            "--systemd-dir", str(systemd_dir),
+            "--polkit-rule", str(polkit_rule),
+        ],
+        obj=ctx,
+    )
+    assert r_reinit.exit_code == 0, r_reinit.output
+    reinit_env = env_file.read_text(encoding="utf-8")
+    assert secret_before in reinit_env
+    assert "FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID=sg-custom-001" in reinit_env
+    assert 'FLIGHTLINK_DTU_ALLOWED_CIDRS=["0.0.0.0/0"]' in reinit_env
 
     # Group create works using DB-stored CIDRs even though Settings had empty CIDRs!
     r_grp = runner.invoke(

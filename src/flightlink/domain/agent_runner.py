@@ -30,7 +30,7 @@ def build_agent(settings: Settings) -> LifecycleAgent:
             archive_service=archive,
         )
 
-    supervisor = LinuxSystemdSupervisor()
+    supervisor = LinuxSystemdSupervisor(runtime_dir=settings.resolved_runtime_dir)
     sockets = LinuxSocketInspector(supervisor)
     region = db.get_meta("aliyun_region") or settings.aliyun_region or "cn-beijing"
     role = db.get_meta("aliyun_ram_role_name") or settings.aliyun_ram_role_name

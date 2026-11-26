@@ -152,6 +152,7 @@ PartOf=flightlink-router@%i.service
 Type=simple
 User=flightlink-archive
 Group=flightlink
+Environment=HOME=/tmp
 EnvironmentFile=-{data_dir / "run"}/mavproxy-%i.env
 ExecStart={mavproxy_bin} --master=${{INTERNAL_TAP_ENDPOINT}} --daemon --non-interactive --no-state --target-system=0
 Restart=on-failure
@@ -200,6 +201,14 @@ def is_linux_root() -> bool:
     return sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+def _resolve_venv_bin() -> Path:
+    """Return the active virtualenv's bin directory WITHOUT following python symlinks to /usr/bin."""
+    candidate = Path(sys.prefix) / ("Scripts" if sys.platform == "win32" else "bin")
+    if candidate.is_dir():
+        return candidate
+    return Path(sys.executable).parent
+
+
 def provision_linux_host(
     *,
     data_dir: Path,
@@ -213,12 +222,13 @@ def provision_linux_host(
     apply_os_commands: bool = True,
 ) -> dict[str, Any]:
     """Provision Linux host users, directories, flightlink.env, systemd units, Polkit, and SELinux."""
-    venv_bin = Path(sys.executable).resolve().parent
+    venv_bin = _resolve_venv_bin()
     routerd_bin = (
         shutil.which("mavlink-routerd")
         or ("/usr/local/bin/mavlink-routerd" if Path("/usr/local/bin/mavlink-routerd").exists() else "/usr/bin/mavlink-routerd")
     )
-    mavproxy_bin = shutil.which("mavproxy.py") or str(venv_bin / "mavproxy.py")
+    venv_mavproxy = venv_bin / "mavproxy.py"
+    mavproxy_bin = str(venv_mavproxy) if venv_mavproxy.exists() else (shutil.which("mavproxy.py") or str(venv_mavproxy))
 
     actions: list[str] = []
 
@@ -296,7 +306,7 @@ def provision_linux_host(
 
 
 def fix_linux_db_permissions(data_dir: Path) -> None:
-    """Ensure SQLite DB and WAL files remain group-writable by `flightlink` after root CLI operations."""
+    """Ensure SQLite DB, WAL, and router config files remain accessible to `flightlink` group after root CLI operations."""
     if not is_linux_root():
         return
     for name in ("control.sqlite3", "control.sqlite3-wal", "control.sqlite3-shm"):
@@ -304,3 +314,10 @@ def fix_linux_db_permissions(data_dir: Path) -> None:
         if p.exists():
             _run_cmd(["chown", "flightlink-agent:flightlink", str(p)], check=False)
             _run_cmd(["chmod", "0660", str(p)], check=False)
+    for subdir in ("router.d", "run"):
+        sub = data_dir / subdir
+        if sub.is_dir():
+            for child in sub.iterdir():
+                if child.is_file():
+                    _run_cmd(["chown", "flightlink-agent:flightlink", str(child)], check=False)
+                    _run_cmd(["chmod", "0640", str(child)], check=False)

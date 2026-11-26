@@ -22,6 +22,7 @@ import json
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,13 +100,25 @@ def _make_context(
         fake = FakeInfrastructure(clock=clock)
         agent = LifecycleAgent(db, settings, supervisor=fake, sockets=fake, sg_client=fake, archive_service=archive, clock=clock)
     else:
-        sup = LinuxSystemdSupervisor()
+        sup = LinuxSystemdSupervisor(runtime_dir=settings.resolved_runtime_dir)
         socks = LinuxSocketInspector(sup)
         region = db.get_meta("aliyun_region") or settings.aliyun_region or "cn-beijing"
         role = db.get_meta("aliyun_ram_role_name") or settings.aliyun_ram_role_name
         sg = AliyunRamSecurityGroupClient(region=region, ram_role_name=role, clock=clock)
         agent = LifecycleAgent(db, settings, supervisor=sup, sockets=socks, sg_client=sg, archive_service=archive, clock=clock)
     return CliContext(settings=settings, db=db, repo=repo, archive=archive, agent=agent, clock=clock)
+
+
+def _execute_or_wait(c: CliContext, operation_id: str, *, timeout_seconds: float = 30.0) -> Any:
+    """Execute pending operation locally, or wait if `flightlink-agent.service` already claimed it."""
+    c.agent.execute_operation(operation_id)
+    fix_linux_db_permissions(c.settings.data_dir)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        op = c.repo.get_operation(operation_id)
+        if op.status not in ("pending", "running") or time.monotonic() >= deadline:
+            return op
+        time.sleep(0.2)
 
 
 def _echo_json(data: Any) -> None:
@@ -254,6 +267,8 @@ def cmd_doctor(c: CliContext) -> None:
     except Exception as exc:
         fw_diff = {"error": str(exc)}
 
+    venv_mavproxy = Path(sys.prefix) / ("Scripts" if sys.platform == "win32" else "bin") / "mavproxy.py"
+    mavproxy_path = str(venv_mavproxy) if venv_mavproxy.exists() else shutil.which("mavproxy.py")
     dtu_cidrs = c.settings.dtu_allowed_cidrs or list(c.db.get_meta_json("dtu_allowed_cidrs", []) or [])
     gcs_cidrs = c.settings.gcs_allowed_cidrs or list(c.db.get_meta_json("gcs_allowed_cidrs", []) or [])
     checks = {
@@ -262,7 +277,7 @@ def cmd_doctor(c: CliContext) -> None:
         "ecs_instance_id": overview.ecs_instance_id,
         "binaries": {
             "mavlink-routerd": shutil.which("mavlink-routerd"),
-            "mavproxy.py": shutil.which("mavproxy.py"),
+            "mavproxy.py": mavproxy_path,
             "systemctl": shutil.which("systemctl"),
             "ss": shutil.which("ss"),
         },
@@ -302,7 +317,7 @@ def cmd_stop(c: CliContext) -> None:
     for g in c.repo.list_groups().items:
         if g.desired_state == "running" or g.router.state == "running":
             op = c.repo.enqueue_group_action(g.group_id, "stop", requested_by=c.actor)
-            c.agent.execute_operation(op.operation_id)
+            _execute_or_wait(c, op.operation_id)
             stopped_groups.append(g.group_id)
 
     units = ["flightlink-api.service", "flightlink-agent.service", "flightlink-archive.service"]
@@ -388,8 +403,9 @@ def cmd_group_create(c: CliContext, name: str, dtu_port: int, gcs: str, wait: bo
     except (DomainError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     if wait:
-        c.agent.execute_operation(op.operation_id)
-        op = c.repo.get_operation(op.operation_id)
+        op = _execute_or_wait(c, op.operation_id)
+    else:
+        fix_linux_db_permissions(c.settings.data_dir)
     _echo_json(op.model_dump())
 
 
@@ -399,8 +415,9 @@ def _run_group_action(c: CliContext, group_id: str, action: str, wait: bool) -> 
     except DomainError as exc:
         raise click.ClickException(f"{exc.code}: {exc.message}") from exc
     if wait:
-        c.agent.execute_operation(op.operation_id)
-        op = c.repo.get_operation(op.operation_id)
+        op = _execute_or_wait(c, op.operation_id)
+    else:
+        fix_linux_db_permissions(c.settings.data_dir)
     _echo_json(op.model_dump())
 
 
@@ -459,8 +476,9 @@ def cmd_group_update(
     except DomainError as exc:
         raise click.ClickException(f"{exc.code}: {exc.message}") from exc
     if wait:
-        c.agent.execute_operation(op.operation_id)
-        op = c.repo.get_operation(op.operation_id)
+        op = _execute_or_wait(c, op.operation_id)
+    else:
+        fix_linux_db_permissions(c.settings.data_dir)
     _echo_json(op.model_dump())
 
 
@@ -474,8 +492,9 @@ def cmd_group_delete(c: CliContext, group_id: str, wait: bool) -> None:
     except DomainError as exc:
         raise click.ClickException(f"{exc.code}: {exc.message}") from exc
     if wait:
-        c.agent.execute_operation(op.operation_id)
-        op = c.repo.get_operation(op.operation_id)
+        op = _execute_or_wait(c, op.operation_id)
+    else:
+        fix_linux_db_permissions(c.settings.data_dir)
     _echo_json(op.model_dump())
 
 
@@ -526,8 +545,9 @@ def cmd_op_retry(c: CliContext, operation_id: str, wait: bool) -> None:
     except DomainError as exc:
         raise click.ClickException(f"{exc.code}: {exc.message}") from exc
     if wait:
-        c.agent.execute_operation(op.operation_id)
-        op = c.repo.get_operation(op.operation_id)
+        op = _execute_or_wait(c, op.operation_id)
+    else:
+        fix_linux_db_permissions(c.settings.data_dir)
     _echo_json(op.model_dump())
 
 

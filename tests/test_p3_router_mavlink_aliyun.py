@@ -36,13 +36,61 @@ from flightlink.domain.operations_repo import ControlPlaneRepository
 def test_router_config_disables_default_tcp_5760_for_udp_gcs() -> None:
     udp_cfg = render_router_config(group_id="grp_u1", dtu_port=5761, gcs_protocol="udp", gcs_port=14553)
     assert "TcpServerPort = 0" in udp_cfg
+    assert "LogMode" not in udp_cfg  # mavlink-routerd v4 rejects `LogMode = disabled`
     assert "[UdpEndpoint gcs]" in udp_cfg
     assert "Port = 14553" in udp_cfg
     assert "Address = 127.0.0.1" in udp_cfg  # loopback-only bypass tap
 
     tcp_cfg = render_router_config(group_id="grp_t1", dtu_port=5760, gcs_protocol="tcp", gcs_port=14552)
     assert "TcpServerPort = 14552" in tcp_cfg
+    assert "LogMode" not in tcp_cfg
     assert "[UdpEndpoint gcs]" not in tcp_cfg
+
+
+def test_linux_systemd_mavproxy_env_and_socket_verify_retry(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from flightlink.adapters.interfaces import ListeningSocket, UnitRuntimeInfo
+    from flightlink.adapters.linux_systemd import LinuxSocketInspector, LinuxSystemdSupervisor
+
+    sup = LinuxSystemdSupervisor(runtime_dir=tmp_path / "run")
+
+    def fake_run(args, **kwargs):
+        if args[:2] == ["systemctl", "start"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["systemctl", "show"]:
+            return subprocess.CompletedProcess(args, 0, stdout="ActiveState=active\nMainPID=4242\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    info = sup.start_mavproxy(group_id="grp_test1", internal_endpoint="udpin:127.0.0.1:41234")
+    assert info.active is True and info.pid == 4242
+    env_file = tmp_path / "run" / "mavproxy-grp_test1.env"
+    assert env_file.exists()
+    assert env_file.read_text(encoding="utf-8").strip() == "INTERNAL_TAP_ENDPOINT=udpin:127.0.0.1:41234"
+
+    # Simulate router binding sockets on the 3rd poll (Type=simple startup latency)
+    calls = {"n": 0}
+    inspector = LinuxSocketInspector(sup)
+
+    def fake_list():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return []
+        return [
+            ListeningSocket(protocol="udp", address="0.0.0.0", port=5760, pid=4242, process_name="mavlink-routerd"),
+            ListeningSocket(protocol="tcp", address="0.0.0.0", port=14552, pid=4242, process_name="mavlink-routerd"),
+        ]
+
+    monkeypatch.setattr(inspector, "list_listening_sockets", fake_list)
+    monkeypatch.setattr(sup, "inspect_router", lambda gid: UnitRuntimeInfo(unit_name="flightlink-router@grp_test1.service", active=True, pid=4242))
+    ok, bound = inspector.verify_group_listening(
+        group_id="grp_test1",
+        endpoints=[("udp", 5760), ("tcp", 14552)],
+        timeout_seconds=1.5,
+    )
+    assert ok is True
+    assert calls["n"] == 3
+    assert "udp://0.0.0.0:5760" in bound and "tcp://0.0.0.0:14552" in bound
 
 
 def test_real_sockets_dual_group_same_sysid_isolation_and_bypass_fault_tolerance() -> None:

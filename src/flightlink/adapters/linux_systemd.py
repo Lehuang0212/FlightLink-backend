@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import time
+from pathlib import Path
 from typing import Literal
 
 from flightlink.adapters.interfaces import (
@@ -50,6 +53,9 @@ def parse_ss_output(raw: str) -> list[ListeningSocket]:
 class LinuxSystemdSupervisor:
     """Manages per-group `flightlink-router@<group_id>.service` and `flightlink-mavproxy@<group_id>.service`."""
 
+    def __init__(self, *, runtime_dir: Path | None = None) -> None:
+        self.runtime_dir = runtime_dir or Path("/var/lib/flightlink/run")
+
     def _run_systemctl(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["systemctl", *args],
@@ -81,6 +87,13 @@ class LinuxSystemdSupervisor:
         return self._inspect_unit(f"flightlink-router@{group_id}.service")
 
     def start_mavproxy(self, *, group_id: str, internal_endpoint: str) -> UnitRuntimeInfo:
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        env_path = self.runtime_dir / f"mavproxy-{group_id}.env"
+        env_path.write_text(f"INTERNAL_TAP_ENDPOINT={internal_endpoint}\n", encoding="utf-8", newline="\n")
+        try:
+            os.chmod(env_path, 0o644)
+        except OSError:
+            pass
         unit = f"flightlink-mavproxy@{group_id}.service"
         res = self._run_systemctl(["start", unit], check=False)
         if res.returncode != 0:
@@ -162,15 +175,23 @@ class LinuxSocketInspector:
         *,
         group_id: str,
         endpoints: list[tuple[Literal["udp", "tcp"], int]],
+        timeout_seconds: float = 3.0,
     ) -> tuple[bool, list[str]]:
-        rt = self.supervisor.inspect_router(group_id)
-        if not rt.active or rt.pid is None:
-            return False, []
-        owned = [s for s in self.list_listening_sockets() if s.pid == rt.pid]
-        owned_pairs = {(s.protocol, s.port) for s in owned}
-        bound_labels = sorted(f"{s.protocol}://{s.address}:{s.port}" for s in owned)
-        ok = all(ep in owned_pairs for ep in endpoints)
-        # Explicitly reject stray default TCP 5760 when not requested!
-        if ("tcp", 5760) in owned_pairs and ("tcp", 5760) not in set(endpoints):
-            return False, bound_labels
-        return ok, bound_labels
+        """Poll briefly after Type=simple systemd start so mavlink-routerd has time to bind sockets."""
+        deadline = time.monotonic() + timeout_seconds
+        last_bound: list[str] = []
+        while True:
+            rt = self.supervisor.inspect_router(group_id)
+            if not rt.active or rt.pid is None:
+                return False, last_bound
+            owned = [s for s in self.list_listening_sockets() if s.pid == rt.pid]
+            owned_pairs = {(s.protocol, s.port) for s in owned}
+            last_bound = sorted(f"{s.protocol}://{s.address}:{s.port}" for s in owned)
+            # Explicitly reject stray default TCP 5760 when not requested!
+            if ("tcp", 5760) in owned_pairs and ("tcp", 5760) not in set(endpoints):
+                return False, last_bound
+            if all(ep in owned_pairs for ep in endpoints):
+                return True, last_bound
+            if time.monotonic() >= deadline:
+                return False, last_bound
+            time.sleep(0.1)
