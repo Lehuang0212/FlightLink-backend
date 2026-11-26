@@ -200,24 +200,17 @@ class AliyunRamSecurityGroupClient:
         self.ram_role_name = ram_role
         self._cached_creds = None
         creds = self.fetch_ram_credentials()
+        # Use DescribeSecurityGroupAttribute directly instead of DescribeSecurityGroups so
+        # strict single-security-group least-privilege RAM policies work without Resource="*".
         data = self._call_ecs(
-            "DescribeSecurityGroups",
+            "DescribeSecurityGroupAttribute",
             {"SecurityGroupId": security_group_id},
         )
-        sgs = data.get("SecurityGroups", {}).get("SecurityGroup", [])
-        if not sgs:
-            raise InfrastructureError(
-                "SECURITY_GROUP_NOT_FOUND",
-                f"Security group '{security_group_id}' not found in region '{region}'.",
-                retryable=False,
-            )
-        # Also verify DescribeSecurityGroupAttribute read permission
-        self._call_ecs("DescribeSecurityGroupAttribute", {"SecurityGroupId": security_group_id})
         return {
             "region": region,
-            "security_group_id": security_group_id,
+            "security_group_id": str(data.get("SecurityGroupId") or security_group_id),
             "ram_role": creds.role_name,
-            "security_group_name": str(sgs[0].get("SecurityGroupName", "")),
+            "security_group_name": str(data.get("SecurityGroupName", "")),
             "status": "verified",
         }
 

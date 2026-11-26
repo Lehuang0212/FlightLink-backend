@@ -179,12 +179,17 @@ def test_aliyun_ram_sg_client_signs_and_revokes_only_by_rule_id() -> None:
         action = form["Action"]
         assert "Signature" in form and form["SecurityToken"] == "TEMP_TOKEN"
         if action == "DescribeSecurityGroups":
+            # Simulate strict single-SG RAM policy where plural DescribeSecurityGroups is forbidden!
+            return httpx.Response(403, json={"Code": "Forbidden.RAM", "Message": "Not authorized on DescribeSecurityGroups"})
+        if action == "DescribeSecurityGroupAttribute":
             return httpx.Response(
                 200,
-                json={"SecurityGroups": {"SecurityGroup": [{"SecurityGroupId": "sg-2ze93ogksv8g4i7tc8vd", "SecurityGroupName": "default"}]}},
+                json={
+                    "SecurityGroupId": "sg-2ze93ogksv8g4i7tc8vd",
+                    "SecurityGroupName": "default",
+                    "Permissions": {"Permission": state["rules"]},
+                },
             )
-        if action == "DescribeSecurityGroupAttribute":
-            return httpx.Response(200, json={"Permissions": {"Permission": state["rules"]}})
         if action == "AuthorizeSecurityGroup":
             rid = f"sgr-fl-{len(state['rules']) + 1}"
             state["rules"].append(

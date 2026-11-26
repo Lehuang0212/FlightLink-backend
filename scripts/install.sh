@@ -80,6 +80,8 @@ else
 fi
 
 ln -sf "${INSTALL_ROOT}/venv/bin/flightlink" /usr/local/bin/flightlink
+# Rocky/RHEL sudo secure_path excludes /usr/local/bin; also link into /usr/bin.
+ln -sf "${INSTALL_ROOT}/venv/bin/flightlink" /usr/bin/flightlink
 
 if command -v getenforce >/dev/null 2>&1; then
   if [[ "$(getenforce)" != "Disabled" ]] && command -v chcon >/dev/null 2>&1; then
