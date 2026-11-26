@@ -1,0 +1,43 @@
+# Virtual environments & IDE
+.venv/
+.venv-*/
+.idea/
+.vscode/
+
+# Python caches & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# Test, lint & coverage caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment secrets (keep templates tracked)
+.env
+.env.*
+!.env.example
+
+# Runtime state, SQLite databases & logs
+data/
+var/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
