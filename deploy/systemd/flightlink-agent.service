@@ -10,6 +10,7 @@ Group=flightlink
 WorkingDirectory=/var/lib/flightlink
 EnvironmentFile=-/etc/flightlink/flightlink.env
 ExecStart=/opt/flightlink/venv/bin/flightlink-agent
+UMask=0007
 Restart=on-failure
 RestartSec=3
 PrivateTmp=true

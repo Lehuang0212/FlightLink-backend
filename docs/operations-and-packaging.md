@@ -36,32 +36,23 @@ python3 -m venv /opt/flightlink/venv
 /opt/flightlink/venv/bin/pip install --no-index --find-links ./wheels flightlink-ecs
 ```
 
-### 2.3 初始化与系统服务安装
+### 2.3 一键安装与 CLI 初始化（自动配置用户 / systemd / Polkit / SELinux / `flightlink.env`）
 ```bash
-# 创建最小权限用户（flightlink-api 与 flightlink-agent 权限严格分离）
-sudo groupadd --system flightlink
-sudo useradd --system --gid flightlink --no-create-home flightlink-api
-sudo useradd --system --gid flightlink --no-create-home flightlink-agent
-sudo useradd --system --gid flightlink --no-create-home flightlink-archive
+# 1. 安装虚拟环境与 /usr/local/bin/flightlink（不修改全局系统源）
+sudo bash scripts/install.sh --mirror aliyun        # 或 --mirror tsinghua / --offline-dir <目录>
 
-sudo install -d -o flightlink-agent -g flightlink -m 0770 /var/lib/flightlink /var/lib/flightlink/archive /var/lib/flightlink/router.d /var/lib/flightlink/run
-sudo cp deploy/systemd/flightlink-*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# 初始化数据库与正式管理员（绝无演示账号）
-/opt/flightlink/venv/bin/flightlink init \
+# 2. 一键初始化主机环境（自动创建隔离用户、目录、flightlink.env、systemd 单元、Polkit、SELinux 与正式管理员）
+sudo flightlink init \
   --admin-user ops_admin --admin-password '<强密码>' \
   --dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0
 
-# 验证并记录已有 RAM 角色和目标业务安全组（不创建角色、不提权）
-/opt/flightlink/venv/bin/flightlink connect --ram \
-  --region cn-beijing --security-group <专用业务安全组ID>
+# 3. 验证并记录 ECS 实例 RAM 角色和目标业务安全组（不传 --ram-role 则自动发现当前挂载角色，传入则严格核对）
+sudo flightlink connect --ram \
+  --region cn-beijing --security-group <专用业务安全组ID> [--ram-role <角色名>]
 
-# 只读自检
-/opt/flightlink/venv/bin/flightlink doctor
-
-# 仅启动管理服务（不批量拉起飞机端口组）
-/opt/flightlink/venv/bin/flightlink run
+# 4. 只读自检 & 启动三个管理服务（不批量拉起飞机端口组）
+sudo flightlink doctor
+sudo flightlink run
 ```
 
 > **管理入口安全**：`flightlink-api` 默认仅监听 `127.0.0.1:8000`；远程访问必须经由 Nginx / Caddy TLS 反向代理提供 HTTPS，且管理入口安全组与业务端口安全组独立。

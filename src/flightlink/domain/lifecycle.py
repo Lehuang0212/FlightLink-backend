@@ -73,8 +73,8 @@ class LifecycleAgent:
 
     def _sg_config(self) -> tuple[str | None, list[str], list[str]]:
         sg_id = self.db.get_meta("aliyun_security_group_id") or self.settings.aliyun_security_group_id
-        dtu_cidrs = self.settings.dtu_allowed_cidrs
-        gcs_cidrs = self.settings.gcs_allowed_cidrs
+        dtu_cidrs = self.settings.dtu_allowed_cidrs or list(self.db.get_meta_json("dtu_allowed_cidrs", []) or [])
+        gcs_cidrs = self.settings.gcs_allowed_cidrs or list(self.db.get_meta_json("gcs_allowed_cidrs", []) or [])
         return sg_id, list(dtu_cidrs), list(gcs_cidrs)
 
     def _desired_sg_specs(

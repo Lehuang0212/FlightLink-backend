@@ -9,6 +9,7 @@ Explicitly enforces safe defaults:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -16,10 +17,19 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _default_env_files() -> tuple[str, ...]:
+    files: list[str] = []
+    sys_env = Path(os.environ.get("FLIGHTLINK_ENV_FILE", "/etc/flightlink/flightlink.env"))
+    if sys_env.is_file() and os.access(sys_env, os.R_OK):
+        files.append(str(sys_env))
+    files.append(".env")
+    return tuple(files)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="FLIGHTLINK_",
-        env_file=".env",
+        env_file=_default_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
     )

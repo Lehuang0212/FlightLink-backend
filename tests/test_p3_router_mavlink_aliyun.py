@@ -208,6 +208,20 @@ def test_aliyun_ram_sg_client_signs_and_revokes_only_by_rule_id() -> None:
     verified = client.validate_connection(region="cn-beijing", security_group_id="sg-2ze93ogksv8g4i7tc8vd")
     assert verified["ram_role"] == "FlightLinkEcsSecurityGroupRole"
 
+    # Explicitly specifying a role name verifies that exact role; omitting ram_role re-discovers cleanly!
+    verified_explicit = client.validate_connection(
+        region="cn-beijing",
+        security_group_id="sg-2ze93ogksv8g4i7tc8vd",
+        ram_role="CustomRoleName",
+    )
+    assert verified_explicit["ram_role"] == "CustomRoleName"
+    verified_rediscovered = client.validate_connection(
+        region="cn-beijing",
+        security_group_id="sg-2ze93ogksv8g4i7tc8vd",
+        ram_role=None,
+    )
+    assert verified_rediscovered["ram_role"] == "FlightLinkEcsSecurityGroupRole"
+
     created = client.authorize_rule(
         security_group_id="sg-2ze93ogksv8g4i7tc8vd",
         protocol="udp",

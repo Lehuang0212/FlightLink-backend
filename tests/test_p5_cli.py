@@ -111,3 +111,79 @@ def test_full_cli_command_surface(tmp_path: Path) -> None:
     stop_res = json.loads(invoke("stop").output)
     assert stop_res["archives_preserved"] is True
     assert ctx.archive.get_session_detail(sid).session_id == sid
+
+
+def test_cli_init_system_provisioning_and_db_cidr_fallback(tmp_path: Path) -> None:
+    """Verify `flightlink init --system` writes flightlink.env, 5 systemd units with UMask=0007,
+    narrow Polkit rule, and DB-stored CIDRs work in LifecycleAgent even when env CIDRs are empty.
+    """
+    runner = CliRunner()
+    clock = ManualClock()
+    # Explicitly leave settings CIDRs empty to test DB fallback!
+    settings = Settings(data_dir=tmp_path / "data", adapter_mode="fake")
+    db = Database(settings.resolved_db_path, clock=clock)
+    db.init_schema(ecs_instance_id="ecs_prov_01")
+    repo = ControlPlaneRepository(db, settings, clock=clock)
+    archive = ArchiveService(db, settings, clock=clock)
+    fake = FakeInfrastructure(clock=clock)
+    agent = LifecycleAgent(
+        db, settings, supervisor=fake, sockets=fake, sg_client=fake, archive_service=archive, clock=clock
+    )
+    ctx = CliContext(settings=settings, db=db, repo=repo, archive=archive, agent=agent, clock=clock)
+
+    env_file = tmp_path / "etc" / "flightlink.env"
+    systemd_dir = tmp_path / "systemd"
+    polkit_rule = tmp_path / "polkit" / "50-flightlink-agent.rules"
+
+    r_init = runner.invoke(
+        cli,
+        [
+            "init",
+            "--system",
+            "--env-file", str(env_file),
+            "--systemd-dir", str(systemd_dir),
+            "--polkit-rule", str(polkit_rule),
+            "--admin-user", "ops_admin",
+            "--admin-password", "AdminPass!123",
+            "--dtu-cidr", "0.0.0.0/0",
+            "--gcs-cidr", "0.0.0.0/0",
+        ],
+        obj=ctx,
+    )
+    assert r_init.exit_code == 0, r_init.output
+    data = json.loads(r_init.output)
+    assert data["system_provisioned"] is not None
+    assert env_file.exists()
+    env_text = env_file.read_text(encoding="utf-8")
+    assert "FLIGHTLINK_JWT_SECRET=" in env_text
+    assert 'FLIGHTLINK_DTU_ALLOWED_CIDRS=["0.0.0.0/0"]' in env_text
+    assert (systemd_dir / "flightlink-api.service").exists()
+    assert "UMask=0007" in (systemd_dir / "flightlink-api.service").read_text(encoding="utf-8")
+    assert "Restart=no" in (systemd_dir / "flightlink-router@.service").read_text(encoding="utf-8")
+    assert polkit_rule.exists()
+    assert "flightlink-router@" in polkit_rule.read_text(encoding="utf-8")
+
+    # connect --ram with explicit --ram-role also updates env_file!
+    r_conn = runner.invoke(
+        cli,
+        [
+            "connect", "--ram",
+            "--region", "cn-beijing",
+            "--security-group", "sg-custom-001",
+            "--ram-role", "MyCustomRole",
+            "--env-file", str(env_file),
+        ],
+        obj=ctx,
+    )
+    assert r_conn.exit_code == 0, r_conn.output
+    assert json.loads(r_conn.output)["ram_role"] == "MyCustomRole"
+    assert "FLIGHTLINK_ALIYUN_RAM_ROLE_NAME=MyCustomRole" in env_file.read_text(encoding="utf-8")
+
+    # Group create works using DB-stored CIDRs even though Settings had empty CIDRs!
+    r_grp = runner.invoke(
+        cli,
+        ["group", "create", "--name", "一号机", "--dtu-port", "5760", "--gcs", "tcp:14552"],
+        obj=ctx,
+    )
+    assert r_grp.exit_code == 0, r_grp.output
+    assert json.loads(r_grp.output)["status"] == "succeeded"

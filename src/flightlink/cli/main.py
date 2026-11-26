@@ -41,6 +41,15 @@ from flightlink.domain.errors import DomainError
 from flightlink.domain.legacy_import import import_legacy_v01_readonly
 from flightlink.domain.lifecycle import LifecycleAgent
 from flightlink.domain.operations_repo import ControlPlaneRepository
+from flightlink.provisioning import (
+    DEFAULT_ENV_PATH,
+    POLKIT_RULE_PATH,
+    SYSTEMD_DIR,
+    fix_linux_db_permissions,
+    is_linux_root,
+    provision_linux_host,
+    write_env_file,
+)
 from flightlink.schemas.groups import CreateGroupRequest, UpdateGroupRequest
 
 
@@ -112,11 +121,17 @@ def cli(ctx: click.Context, data_dir: Path | None, adapter_mode: str | None) -> 
     ctx.obj = _make_context(data_dir=data_dir, adapter_mode=adapter_mode, injected_ctx=injected)
 
 
-@cli.command("init", help="Initialize FlightLink directories, SQLite database, and optional initial admin account.")
+@cli.command("init", help="Initialize FlightLink host environment, directories, SQLite DB, and optional admin account.")
 @click.option("--admin-user", default=None, help="Create initial admin username.")
 @click.option("--admin-password", default=None, help="Initial admin password (>= 8 chars).")
 @click.option("--dtu-cidr", multiple=True, help="Explicitly allowed DTU source CIDR (e.g. 0.0.0.0/0).")
 @click.option("--gcs-cidr", multiple=True, help="Explicitly allowed GCS source CIDR (e.g. 0.0.0.0/0).")
+@click.option("--api-host", default="127.0.0.1", show_default=True, help="API listen host.")
+@click.option("--api-port", type=int, default=8000, show_default=True, help="API listen port.")
+@click.option("--system/--no-system", "provision_system", default=None, help="Provision Linux users, systemd units, Polkit, SELinux, and flightlink.env (auto-enabled as Linux root).")
+@click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
+@click.option("--systemd-dir", type=click.Path(path_type=Path), default=SYSTEMD_DIR, hidden=True)
+@click.option("--polkit-rule", type=click.Path(path_type=Path), default=POLKIT_RULE_PATH, hidden=True)
 @click.pass_obj
 def cmd_init(
     c: CliContext,
@@ -124,7 +139,28 @@ def cmd_init(
     admin_password: str | None,
     dtu_cidr: tuple[str, ...],
     gcs_cidr: tuple[str, ...],
+    api_host: str,
+    api_port: int,
+    provision_system: bool | None,
+    env_file: Path,
+    systemd_dir: Path,
+    polkit_rule: Path,
 ) -> None:
+    do_system = is_linux_root() if provision_system is None else provision_system
+    system_report = None
+    if do_system:
+        system_report = provision_linux_host(
+            data_dir=c.settings.data_dir,
+            env_file=env_file,
+            systemd_dir=systemd_dir,
+            polkit_rule_path=polkit_rule,
+            api_host=api_host,
+            api_port=api_port,
+            dtu_cidrs=list(dtu_cidr) if dtu_cidr else None,
+            gcs_cidrs=list(gcs_cidr) if gcs_cidr else None,
+            apply_os_commands=is_linux_root(),
+        )
+
     c.settings.data_dir.mkdir(parents=True, exist_ok=True)
     c.settings.resolved_archive_dir.mkdir(parents=True, exist_ok=True)
     c.settings.resolved_router_config_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +184,8 @@ def cmd_init(
         except DomainError as exc:
             raise click.ClickException(f"{exc.code}: {exc.message}") from exc
 
+    fix_linux_db_permissions(c.settings.data_dir)
+
     _echo_json(
         {
             "status": "initialized",
@@ -156,6 +194,7 @@ def cmd_init(
             "archive_dir": str(c.settings.resolved_archive_dir),
             "router_config_dir": str(c.settings.resolved_router_config_dir),
             "admin_created": created_admin,
+            "system_provisioned": system_report,
         }
     )
 
@@ -164,7 +203,8 @@ def cmd_init(
 @click.option("--ram", "use_ram", is_flag=True, required=True, help="Authenticate using ECS instance RAM role (no static AccessKey).")
 @click.option("--region", required=True, help="Aliyun region ID, e.g. cn-beijing.")
 @click.option("--security-group", "security_group_id", required=True, help="Target business security group ID.")
-@click.option("--ram-role", default=None, help="Optional expected RAM role name.")
+@click.option("--ram-role", default=None, help="Optional expected RAM role name; omit to auto-discover attached ECS instance role.")
+@click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
 @click.pass_obj
 def cmd_connect(
     c: CliContext,
@@ -172,6 +212,7 @@ def cmd_connect(
     region: str,
     security_group_id: str,
     ram_role: str | None,
+    env_file: Path,
 ) -> None:
     if not use_ram:
         raise click.ClickException("Only --ram instance role authentication is supported.")
@@ -184,9 +225,23 @@ def cmd_connect(
     except Exception as exc:
         raise click.ClickException(f"RAM/SecurityGroup verification failed: {exc}") from exc
 
+    resolved_role = verified.get("ram_role", ram_role or "")
     c.db.set_meta("aliyun_region", region)
     c.db.set_meta("aliyun_security_group_id", security_group_id)
-    c.db.set_meta("aliyun_ram_role_name", verified.get("ram_role", ram_role or ""))
+    c.db.set_meta("aliyun_ram_role_name", resolved_role)
+    if env_file.exists():
+        try:
+            write_env_file(
+                env_file,
+                {
+                    "FLIGHTLINK_ALIYUN_REGION": region,
+                    "FLIGHTLINK_ALIYUN_SECURITY_GROUP_ID": security_group_id,
+                    "FLIGHTLINK_ALIYUN_RAM_ROLE_NAME": resolved_role,
+                },
+            )
+        except OSError:
+            pass
+    fix_linux_db_permissions(c.settings.data_dir)
     _echo_json({**verified, "status": "connected"})
 
 
@@ -199,6 +254,8 @@ def cmd_doctor(c: CliContext) -> None:
     except Exception as exc:
         fw_diff = {"error": str(exc)}
 
+    dtu_cidrs = c.settings.dtu_allowed_cidrs or list(c.db.get_meta_json("dtu_allowed_cidrs", []) or [])
+    gcs_cidrs = c.settings.gcs_allowed_cidrs or list(c.db.get_meta_json("gcs_allowed_cidrs", []) or [])
     checks = {
         "read_only": True,
         "db_ok": c.db.health_check(),
@@ -213,8 +270,8 @@ def cmd_doctor(c: CliContext) -> None:
             "region": c.db.get_meta("aliyun_region") or c.settings.aliyun_region,
             "security_group_id": c.db.get_meta("aliyun_security_group_id") or c.settings.aliyun_security_group_id,
             "ram_role": c.db.get_meta("aliyun_ram_role_name") or c.settings.aliyun_ram_role_name,
-            "dtu_allowed_cidrs": c.settings.dtu_allowed_cidrs,
-            "gcs_allowed_cidrs": c.settings.gcs_allowed_cidrs,
+            "dtu_allowed_cidrs": dtu_cidrs,
+            "gcs_allowed_cidrs": gcs_cidrs,
         },
         "disk": overview.disk.model_dump(),
         "metrics": overview.metrics.model_dump(),
@@ -234,8 +291,7 @@ def cmd_run(c: CliContext) -> None:
         c.db.record_component_heartbeat("flightlink-archive", "ok", "Started by flightlink run")
         _echo_json({"status": "started", "services": units, "aircraft_channels_auto_started": False})
         return
-    for unit in units:
-        subprocess.run(["systemctl", "start", unit], check=True)
+    subprocess.run(["systemctl", "enable", "--now", *units], check=True)
     _echo_json({"status": "started", "services": units, "aircraft_channels_auto_started": False})
 
 

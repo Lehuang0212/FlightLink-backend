@@ -195,8 +195,10 @@ class AliyunRamSecurityGroupClient:
         ram_role: str | None = None,
     ) -> dict[str, str]:
         self.region = region
-        if ram_role:
-            self.ram_role_name = ram_role
+        # Reset cached credentials & role so omitting ram_role cleanly re-discovers the current ECS role,
+        # while providing ram_role strictly verifies that exact role name via IMDS.
+        self.ram_role_name = ram_role
+        self._cached_creds = None
         creds = self.fetch_ram_credentials()
         data = self._call_ecs(
             "DescribeSecurityGroups",
