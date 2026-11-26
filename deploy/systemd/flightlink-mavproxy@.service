@@ -8,10 +8,12 @@ PartOf=flightlink-router@%i.service
 Type=simple
 User=flightlink-archive
 Group=flightlink
+Environment=HOME=/tmp
 EnvironmentFile=-/var/lib/flightlink/run/mavproxy-%i.env
 ExecStart=/opt/flightlink/venv/bin/mavproxy.py --master=${INTERNAL_TAP_ENDPOINT} --daemon --non-interactive --no-state --target-system=0
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=3
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=flightlink-mavproxy-%i

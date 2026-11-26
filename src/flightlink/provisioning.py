@@ -134,6 +134,7 @@ User=flightlink-agent
 Group=flightlink
 ExecStart={mavlink_routerd_bin} -c {data_dir / "router.d"}/%i.conf
 Restart=no
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=flightlink-router-%i
@@ -157,6 +158,7 @@ EnvironmentFile=-{data_dir / "run"}/mavproxy-%i.env
 ExecStart={mavproxy_bin} --master=${{INTERNAL_TAP_ENDPOINT}} --daemon --non-interactive --no-state --target-system=0
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=3
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=flightlink-mavproxy-%i

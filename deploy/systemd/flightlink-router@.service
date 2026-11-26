@@ -10,6 +10,7 @@ User=flightlink-agent
 Group=flightlink
 ExecStart=/usr/bin/mavlink-routerd -c /var/lib/flightlink/router.d/%i.conf
 Restart=no
+TimeoutStopSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=flightlink-router-%i

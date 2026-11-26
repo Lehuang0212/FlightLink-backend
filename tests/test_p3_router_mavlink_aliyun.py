@@ -92,6 +92,19 @@ def test_linux_systemd_mavproxy_env_and_socket_verify_retry(tmp_path: Path, monk
     assert calls["n"] == 3
     assert "udp://0.0.0.0:5760" in bound and "tcp://0.0.0.0:14552" in bound
 
+    # Simulate mavproxy.py ignoring SIGTERM -> stop_mavproxy falls back to SIGKILL and never raises!
+    stop_cmds: list[list[str]] = []
+
+    def hanging_stop(args, **kwargs):
+        stop_cmds.append(list(args))
+        if args[:2] == ["systemctl", "stop"] and len(stop_cmds) == 1:
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 8.0))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", hanging_stop)
+    sup.stop_mavproxy("grp_test1")
+    assert any(cmd[:3] == ["systemctl", "kill", "--signal=SIGKILL"] for cmd in stop_cmds)
+
 
 def test_real_sockets_dual_group_same_sysid_isolation_and_bypass_fault_tolerance() -> None:
     """Two real-socket routers (UDP GCS & TCP GCS) with identical SYSID=1:

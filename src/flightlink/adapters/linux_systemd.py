@@ -56,14 +56,27 @@ class LinuxSystemdSupervisor:
     def __init__(self, *, runtime_dir: Path | None = None) -> None:
         self.runtime_dir = runtime_dir or Path("/var/lib/flightlink/run")
 
-    def _run_systemctl(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def _run_systemctl(
+        self, args: list[str], *, check: bool = True, timeout: float = 20.0
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["systemctl", *args],
             capture_output=True,
             text=True,
             check=check,
-            timeout=20,
+            timeout=timeout,
         )
+
+    def _stop_unit_safely(self, unit: str, *, stop_timeout: float = 10.0) -> None:
+        """Stop unit cleanly; if a process ignores SIGTERM, force-kill so stop/delete never hangs."""
+        try:
+            self._run_systemctl(["stop", unit], check=False, timeout=stop_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                self._run_systemctl(["kill", "--signal=SIGKILL", unit], check=False, timeout=5.0)
+                self._run_systemctl(["stop", unit], check=False, timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
 
     def start_router(
         self,
@@ -81,7 +94,7 @@ class LinuxSystemdSupervisor:
         return self.inspect_router(group_id)
 
     def stop_router(self, group_id: str) -> None:
-        self._run_systemctl(["stop", f"flightlink-router@{group_id}.service"], check=False)
+        self._stop_unit_safely(f"flightlink-router@{group_id}.service", stop_timeout=10.0)
 
     def inspect_router(self, group_id: str) -> UnitRuntimeInfo:
         return self._inspect_unit(f"flightlink-router@{group_id}.service")
@@ -101,7 +114,7 @@ class LinuxSystemdSupervisor:
         return self.inspect_mavproxy(group_id)
 
     def stop_mavproxy(self, group_id: str) -> None:
-        self._run_systemctl(["stop", f"flightlink-mavproxy@{group_id}.service"], check=False)
+        self._stop_unit_safely(f"flightlink-mavproxy@{group_id}.service", stop_timeout=8.0)
 
     def inspect_mavproxy(self, group_id: str) -> UnitRuntimeInfo:
         return self._inspect_unit(f"flightlink-mavproxy@{group_id}.service")
