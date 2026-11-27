@@ -210,3 +210,240 @@ def test_cli_init_system_provisioning_and_db_cidr_fallback(tmp_path: Path) -> No
     )
     assert r_grp.exit_code == 0, r_grp.output
     assert json.loads(r_grp.output)["status"] == "succeeded"
+
+
+def test_cli_custom_api_port_and_conflict_guard(tmp_path: Path) -> None:
+    """Verify `--port` / `--host` on `init` and `run`, env preservation, and API<->group port conflict rejection."""
+    runner = CliRunner()
+    ctx = _make_cli_ctx(tmp_path / "data")
+    env_file = tmp_path / "etc" / "flightlink.env"
+    systemd_dir = tmp_path / "systemd"
+    polkit_rule = tmp_path / "polkit" / "50-flightlink-agent.rules"
+
+    # 1. init --system --port 18080 persists custom port
+    r1 = runner.invoke(
+        cli,
+        [
+            "init", "--system",
+            "--port", "18080",
+            "--host", "127.0.0.1",
+            "--env-file", str(env_file),
+            "--systemd-dir", str(systemd_dir),
+            "--polkit-rule", str(polkit_rule),
+        ],
+        obj=ctx,
+    )
+    assert r1.exit_code == 0, r1.output
+    assert json.loads(r1.output)["api_listen"] == "127.0.0.1:18080"
+    assert "FLIGHTLINK_API_PORT=18080" in env_file.read_text(encoding="utf-8")
+
+    # 2. Re-running init without --port preserves 18080 (never resets back to 8000)
+    r2 = runner.invoke(
+        cli,
+        [
+            "init", "--system",
+            "--env-file", str(env_file),
+            "--systemd-dir", str(systemd_dir),
+            "--polkit-rule", str(polkit_rule),
+        ],
+        obj=ctx,
+    )
+    assert r2.exit_code == 0, r2.output
+    assert json.loads(r2.output)["api_listen"] == "127.0.0.1:18080"
+    assert "FLIGHTLINK_API_PORT=18080" in env_file.read_text(encoding="utf-8")
+
+    # 3. Creating a group using the API port (18080) MUST be rejected with PORT_CONFLICT
+    r_conflict_grp = runner.invoke(
+        cli,
+        ["group", "create", "--name", "撞口机", "--dtu-port", "5760", "--gcs", "tcp:18080"],
+        obj=ctx,
+    )
+    assert r_conflict_grp.exit_code != 0
+    assert "18080" in r_conflict_grp.output
+
+    # 4. Create valid group (5760 / 14552); trying `run --port 14552` MUST be rejected
+    r_ok_grp = runner.invoke(
+        cli,
+        ["group", "create", "--name", "正常机", "--dtu-port", "5760", "--gcs", "tcp:14552"],
+        obj=ctx,
+    )
+    assert r_ok_grp.exit_code == 0, r_ok_grp.output
+
+    r_conflict_run = runner.invoke(
+        cli,
+        ["run", "--port", "14552", "--env-file", str(env_file)],
+        obj=ctx,
+    )
+    assert r_conflict_run.exit_code != 0
+    assert "PORT_CONFLICT" in r_conflict_run.output
+
+    # 5. `run --port 19090` updates env_file and shows up in doctor
+    r_run = runner.invoke(
+        cli,
+        ["run", "--port", "19090", "--env-file", str(env_file)],
+        obj=ctx,
+    )
+    assert r_run.exit_code == 0, r_run.output
+    run_data = json.loads(r_run.output)
+    assert run_data["api_listen"] == "127.0.0.1:19090"
+    assert run_data["env_updated"] is True
+    assert "FLIGHTLINK_API_PORT=19090" in env_file.read_text(encoding="utf-8")
+
+    r_doc = runner.invoke(cli, ["doctor", "--env-file", str(env_file)], obj=ctx)
+    assert r_doc.exit_code == 0, r_doc.output
+    assert json.loads(r_doc.output)["api_listen"] == "127.0.0.1:19090"
+
+
+def test_cli_clear_legacy_runtime_and_all_modes(tmp_path: Path) -> None:
+    """Verify `flightlink clear` safely cleans v0.1 remnants (default), 1.0 orphaned runtime files,
+    and requires `--yes` for `--all` while preserving archives & manual cloud SG rules by default.
+    """
+    runner = CliRunner()
+    ctx = _make_cli_ctx(tmp_path / "data")
+    root_prefix = tmp_path / "root"
+    env_file = tmp_path / "etc" / "flightlink.env"
+    systemd_dir = tmp_path / "systemd"
+    polkit_rule = tmp_path / "polkit" / "50-flightlink-agent.rules"
+
+    # Provision 1.0 host files + connect SG + create active group + seed archive + manual SG rule
+    assert runner.invoke(
+        cli,
+        [
+            "init", "--system",
+            "--env-file", str(env_file),
+            "--systemd-dir", str(systemd_dir),
+            "--polkit-rule", str(polkit_rule),
+        ],
+        obj=ctx,
+    ).exit_code == 0
+    assert runner.invoke(
+        cli,
+        ["connect", "--ram", "--region", "cn-beijing", "--security-group", "sg-clear-01", "--env-file", str(env_file)],
+        obj=ctx,
+    ).exit_code == 0
+    ctx.agent.sg_client.authorize_rule(
+        security_group_id="sg-clear-01",
+        protocol="tcp",
+        port=22,
+        source_cidr="10.0.0.0/8",
+        description="manual-ssh-keep",
+    )
+    r_grp = runner.invoke(
+        cli,
+        ["group", "create", "--name", "留存机", "--dtu-port", "5760", "--gcs", "tcp:14552"],
+        obj=ctx,
+    )
+    assert r_grp.exit_code == 0
+    active_gid = json.loads(r_grp.output)["group_id"]
+
+    # Seed archive file to verify preservation
+    arch_file = ctx.settings.resolved_archive_dir / active_gid / "sess_keep" / "router.log"
+    arch_file.parent.mkdir(parents=True, exist_ok=True)
+    arch_file.write_text("precious flight log\n", encoding="utf-8")
+
+    # Plant legacy v0.1 remnants
+    legacy_capture = systemd_dir / "flightlink-capture@.service"
+    legacy_dropin = systemd_dir / "flightlink-api.service.d" / "service-control.conf"
+    legacy_routerctl = root_prefix / "usr/local/sbin/flightlink-routerctl"
+    legacy_sudoers = root_prefix / "etc/sudoers.d/flightlink-router-control"
+    legacy_api_env = env_file.parent / "api.env"
+    for f in (legacy_capture, legacy_dropin, legacy_routerctl, legacy_sudoers, legacy_api_env):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("legacy", encoding="utf-8")
+
+    # 1. doctor detects legacy remnants read-only
+    doc = json.loads(
+        runner.invoke(
+            cli,
+            ["doctor", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert doc["legacy_remnants"]["detected"] is True
+    assert str(legacy_capture) in doc["legacy_remnants"]["paths"]
+
+    # 2. `clear --dry-run` previews without deleting anything
+    dry = json.loads(
+        runner.invoke(
+            cli,
+            ["clear", "--dry-run", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert dry["dry_run"] is True and dry["mode"] == "legacy"
+    assert legacy_capture.exists() and legacy_routerctl.exists()
+
+    # 3. Default `clear` removes core legacy remnants only, keeping 1.0 units/env/DB/archive and noting api.env
+    res_legacy = json.loads(
+        runner.invoke(
+            cli,
+            ["clear", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert res_legacy["mode"] == "legacy" and res_legacy["archives_preserved"] is True
+    assert not legacy_capture.exists()
+    assert not legacy_dropin.parent.exists()
+    assert not legacy_routerctl.exists()
+    assert not legacy_sudoers.exists()
+    assert legacy_api_env.exists()  # kept unless --include-legacy-app
+    assert (systemd_dir / "flightlink-api.service").exists()
+    assert env_file.exists() and arch_file.exists()
+
+    # 4. `clear --runtime` removes orphaned router.d/run artifacts without touching active group
+    cand_conf = ctx.settings.resolved_router_config_dir / f"{active_gid}.candidate.conf"
+    orphan_conf = ctx.settings.resolved_router_config_dir / "grp_orphan.conf"
+    orphan_env = ctx.settings.resolved_runtime_dir / "mavproxy-grp_orphan.env"
+    active_env = ctx.settings.resolved_runtime_dir / f"mavproxy-{active_gid}.env"
+    for f in (cand_conf, orphan_conf, orphan_env, active_env):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("tmp", encoding="utf-8")
+
+    res_rt = json.loads(
+        runner.invoke(
+            cli,
+            ["clear", "--runtime", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert res_rt["mode"] == "runtime"
+    assert not cand_conf.exists() and not orphan_conf.exists() and not orphan_env.exists()
+    assert active_env.exists() and (ctx.settings.resolved_router_config_dir / f"{active_gid}.conf").exists()
+
+    # 5. `clear --all` without `--yes` MUST fail
+    r_no_yes = runner.invoke(
+        cli,
+        ["clear", "--all", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+        obj=ctx,
+    )
+    assert r_no_yes.exit_code != 0
+    assert "--yes" in r_no_yes.output
+
+    # 6. `clear --all --yes` revokes ONLY owned cloud SG rules, removes 1.0 files, preserves archive & manual SSH rule!
+    res_all = json.loads(
+        runner.invoke(
+            cli,
+            ["clear", "--all", "--yes", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert res_all["mode"] == "all" and res_all["archives_preserved"] is True
+    assert len(res_all["cloud_rules_revoked"]) == 2
+    assert res_all["cloud_manual_preserved"] == 1
+    remaining_rules = ctx.agent.sg_client.list_rules(security_group_id="sg-clear-01")
+    assert [r.description for r in remaining_rules] == ["manual-ssh-keep"]
+    assert not env_file.exists()
+    assert not (systemd_dir / "flightlink-api.service").exists()
+    assert not polkit_rule.exists()
+    assert arch_file.exists()  # Archives preserved by default!
+
+    # 7. `clear --all --yes --purge-archives` removes archives when explicitly requested
+    res_purge = json.loads(
+        runner.invoke(
+            cli,
+            ["clear", "--all", "--yes", "--purge-archives", "--skip-cloud", "--env-file", str(env_file), "--systemd-dir", str(systemd_dir), "--polkit-rule", str(polkit_rule), "--root-prefix", str(root_prefix)],
+            obj=ctx,
+        ).output
+    )
+    assert res_purge["archives_preserved"] is False
+    assert not arch_file.exists()

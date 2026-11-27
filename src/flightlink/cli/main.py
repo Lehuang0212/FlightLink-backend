@@ -35,6 +35,7 @@ from flightlink.adapters.interfaces import FakeInfrastructure
 from flightlink.adapters.linux_systemd import LinuxSocketInspector, LinuxSystemdSupervisor
 from flightlink.archive.service import ArchiveService
 from flightlink.archive.storage import build_session_bundle_tgz
+from flightlink.cleanup import clear_environment, scan_legacy_remnants
 from flightlink.clock import Clock, SystemClock
 from flightlink.config import Settings
 from flightlink.db import Database
@@ -48,6 +49,7 @@ from flightlink.provisioning import (
     SYSTEMD_DIR,
     fix_linux_db_permissions,
     is_linux_root,
+    parse_env_file,
     provision_linux_host,
     write_env_file,
 )
@@ -82,6 +84,7 @@ def _make_context(
     data_dir: Path | None = None,
     adapter_mode: str | None = None,
     injected_ctx: CliContext | None = None,
+    init_db: bool = True,
 ) -> CliContext:
     if injected_ctx is not None:
         return injected_ctx
@@ -93,7 +96,8 @@ def _make_context(
     settings = Settings(**kwargs)
     clock = SystemClock()
     db = Database(settings.resolved_db_path, clock=clock)
-    db.init_schema(ecs_instance_id=settings.ecs_instance_id)
+    if init_db:
+        db.init_schema(ecs_instance_id=settings.ecs_instance_id)
     repo = ControlPlaneRepository(db, settings, clock=clock)
     archive = ArchiveService(db, settings, clock=clock)
     if settings.adapter_mode == "fake":
@@ -102,8 +106,8 @@ def _make_context(
     else:
         sup = LinuxSystemdSupervisor(runtime_dir=settings.resolved_runtime_dir)
         socks = LinuxSocketInspector(sup)
-        region = db.get_meta("aliyun_region") or settings.aliyun_region or "cn-beijing"
-        role = db.get_meta("aliyun_ram_role_name") or settings.aliyun_ram_role_name
+        region = (db.get_meta("aliyun_region") if init_db else None) or settings.aliyun_region or "cn-beijing"
+        role = (db.get_meta("aliyun_ram_role_name") if init_db else None) or settings.aliyun_ram_role_name
         sg = AliyunRamSecurityGroupClient(region=region, ram_role_name=role, clock=clock)
         agent = LifecycleAgent(db, settings, supervisor=sup, sockets=socks, sg_client=sg, archive_service=archive, clock=clock)
     return CliContext(settings=settings, db=db, repo=repo, archive=archive, agent=agent, clock=clock)
@@ -131,7 +135,39 @@ def _echo_json(data: Any) -> None:
 @click.pass_context
 def cli(ctx: click.Context, data_dir: Path | None, adapter_mode: str | None) -> None:
     injected = ctx.obj if isinstance(ctx.obj, CliContext) else None
-    ctx.obj = _make_context(data_dir=data_dir, adapter_mode=adapter_mode, injected_ctx=injected)
+    init_db = True
+    if ctx.invoked_subcommand == "clear" and injected is None:
+        probe_settings = Settings(data_dir=data_dir) if data_dir is not None else Settings()
+        init_db = probe_settings.resolved_db_path.exists()
+    ctx.obj = _make_context(data_dir=data_dir, adapter_mode=adapter_mode, injected_ctx=injected, init_db=init_db)
+
+
+def _ensure_api_port_not_reserved(c: CliContext, port: int) -> None:
+    """Reject setting API listen port to a port already reserved by a port group."""
+    with c.db.read() as conn:
+        row = conn.execute(
+            """
+            SELECT pr.group_id, pg.name, pr.role, pr.protocol
+            FROM port_reservations pr
+            LEFT JOIN port_groups pg ON pg.group_id = pr.group_id
+            WHERE pr.port = ?
+            LIMIT 1
+            """,
+            (port,),
+        ).fetchone()
+    if row is not None:
+        owner = row["name"] or row["group_id"]
+        raise click.ClickException(
+            f"PORT_CONFLICT: API port {port} conflicts with reserved {row['role']}/{row['protocol']} port of group '{owner}'."
+        )
+
+
+def _resolve_api_listen(c: CliContext, env_file: Path = DEFAULT_ENV_PATH) -> tuple[str, int]:
+    env_vals = parse_env_file(env_file) if env_file.exists() else {}
+    host = env_vals.get("FLIGHTLINK_API_HOST") or c.settings.api_host
+    port_raw = env_vals.get("FLIGHTLINK_API_PORT")
+    port = int(port_raw) if (port_raw and port_raw.isdigit()) else c.settings.api_port
+    return host, port
 
 
 @cli.command("init", help="Initialize FlightLink host environment, directories, SQLite DB, and optional admin account.")
@@ -139,8 +175,8 @@ def cli(ctx: click.Context, data_dir: Path | None, adapter_mode: str | None) -> 
 @click.option("--admin-password", default=None, help="Initial admin password (>= 8 chars).")
 @click.option("--dtu-cidr", multiple=True, help="Explicitly allowed DTU source CIDR (e.g. 0.0.0.0/0).")
 @click.option("--gcs-cidr", multiple=True, help="Explicitly allowed GCS source CIDR (e.g. 0.0.0.0/0).")
-@click.option("--api-host", default="127.0.0.1", show_default=True, help="API listen host.")
-@click.option("--api-port", type=int, default=8000, show_default=True, help="API listen port.")
+@click.option("--host", "--api-host", "api_host", default=None, help="API listen host (default: 127.0.0.1; preserves existing env if omitted).")
+@click.option("--port", "--api-port", "api_port", type=click.IntRange(1, 65535), default=None, help="API listen port (default: 8000; preserves existing env if omitted).")
 @click.option("--system/--no-system", "provision_system", default=None, help="Provision Linux users, systemd units, Polkit, SELinux, and flightlink.env (auto-enabled as Linux root).")
 @click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
 @click.option("--systemd-dir", type=click.Path(path_type=Path), default=SYSTEMD_DIR, hidden=True)
@@ -152,13 +188,16 @@ def cmd_init(
     admin_password: str | None,
     dtu_cidr: tuple[str, ...],
     gcs_cidr: tuple[str, ...],
-    api_host: str,
-    api_port: int,
+    api_host: str | None,
+    api_port: int | None,
     provision_system: bool | None,
     env_file: Path,
     systemd_dir: Path,
     polkit_rule: Path,
 ) -> None:
+    if api_port is not None:
+        _ensure_api_port_not_reserved(c, api_port)
+
     do_system = is_linux_root() if provision_system is None else provision_system
     system_report = None
     if do_system:
@@ -173,6 +212,18 @@ def cmd_init(
             gcs_cidrs=list(gcs_cidr) if gcs_cidr else None,
             apply_os_commands=is_linux_root(),
         )
+    elif (api_host is not None or api_port is not None) and env_file.exists():
+        updates: dict[str, str] = {}
+        if api_host is not None:
+            updates["FLIGHTLINK_API_HOST"] = api_host
+        if api_port is not None:
+            updates["FLIGHTLINK_API_PORT"] = str(api_port)
+        write_env_file(env_file, updates)
+
+    if api_host is not None:
+        c.settings.api_host = api_host
+    if api_port is not None:
+        c.settings.api_port = api_port
 
     c.settings.data_dir.mkdir(parents=True, exist_ok=True)
     c.settings.resolved_archive_dir.mkdir(parents=True, exist_ok=True)
@@ -198,11 +249,13 @@ def cmd_init(
             raise click.ClickException(f"{exc.code}: {exc.message}") from exc
 
     fix_linux_db_permissions(c.settings.data_dir)
+    resolved_host, resolved_port = _resolve_api_listen(c, env_file=env_file)
 
     _echo_json(
         {
             "status": "initialized",
             "ecs_instance_id": ecs_id,
+            "api_listen": f"{resolved_host}:{resolved_port}",
             "db_path": str(c.settings.resolved_db_path),
             "archive_dir": str(c.settings.resolved_archive_dir),
             "router_config_dir": str(c.settings.resolved_router_config_dir),
@@ -258,9 +311,12 @@ def cmd_connect(
     _echo_json({**verified, "status": "connected"})
 
 
-@cli.command("doctor", help="Strictly read-only health, configuration, binary, disk, and firewall diagnostic check.")
+@cli.command("doctor", help="Strictly read-only health, configuration, binary, disk, legacy remnant, and firewall diagnostic check.")
+@click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
+@click.option("--systemd-dir", type=click.Path(path_type=Path), default=SYSTEMD_DIR, hidden=True)
+@click.option("--root-prefix", type=click.Path(path_type=Path), default=None, hidden=True)
 @click.pass_obj
-def cmd_doctor(c: CliContext) -> None:
+def cmd_doctor(c: CliContext, env_file: Path, systemd_dir: Path, root_prefix: Path | None) -> None:
     overview = c.repo.get_overview()
     try:
         fw_diff = c.agent.compute_firewall_diff()
@@ -271,16 +327,25 @@ def cmd_doctor(c: CliContext) -> None:
     mavproxy_path = str(venv_mavproxy) if venv_mavproxy.exists() else shutil.which("mavproxy.py")
     dtu_cidrs = c.settings.dtu_allowed_cidrs or list(c.db.get_meta_json("dtu_allowed_cidrs", []) or [])
     gcs_cidrs = c.settings.gcs_allowed_cidrs or list(c.db.get_meta_json("gcs_allowed_cidrs", []) or [])
+    api_host, api_port = _resolve_api_listen(c, env_file=env_file)
+    legacy = scan_legacy_remnants(
+        systemd_dir=systemd_dir,
+        env_file=env_file,
+        root_prefix=root_prefix,
+        inspect_systemd=c.settings.adapter_mode != "fake" and is_linux_root(),
+    )
     checks = {
         "read_only": True,
         "db_ok": c.db.health_check(),
         "ecs_instance_id": overview.ecs_instance_id,
+        "api_listen": f"{api_host}:{api_port}",
         "binaries": {
             "mavlink-routerd": shutil.which("mavlink-routerd"),
             "mavproxy.py": mavproxy_path,
             "systemctl": shutil.which("systemctl"),
             "ss": shutil.which("ss"),
         },
+        "legacy_remnants": legacy,
         "aliyun": {
             "region": c.db.get_meta("aliyun_region") or c.settings.aliyun_region,
             "security_group_id": c.db.get_meta("aliyun_security_group_id") or c.settings.aliyun_security_group_id,
@@ -297,17 +362,135 @@ def cmd_doctor(c: CliContext) -> None:
 
 
 @cli.command("run", help="Start management services (flightlink-api, flightlink-agent, flightlink-archive); NEVER batch-starts aircraft channels.")
+@click.option("--host", "--api-host", "api_host", default=None, help="Override API listen host and persist to flightlink.env.")
+@click.option("--port", "--api-port", "api_port", type=click.IntRange(1, 65535), default=None, help="Override API listen port (default: 8000) and persist to flightlink.env.")
+@click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
 @click.pass_obj
-def cmd_run(c: CliContext) -> None:
+def cmd_run(c: CliContext, api_host: str | None, api_port: int | None, env_file: Path) -> None:
+    if api_port is not None:
+        _ensure_api_port_not_reserved(c, api_port)
+
+    env_updated = False
+    if api_host is not None or api_port is not None:
+        updates: dict[str, str] = {}
+        if api_host is not None:
+            updates["FLIGHTLINK_API_HOST"] = api_host
+            c.settings.api_host = api_host
+        if api_port is not None:
+            updates["FLIGHTLINK_API_PORT"] = str(api_port)
+            c.settings.api_port = api_port
+        if env_file.exists() or is_linux_root() or env_file != DEFAULT_ENV_PATH:
+            write_env_file(env_file, updates)
+            env_updated = True
+            if is_linux_root():
+                subprocess.run(["chown", "root:flightlink", str(env_file)], check=False)
+                subprocess.run(["chmod", "0640", str(env_file)], check=False)
+
+    resolved_host, resolved_port = _resolve_api_listen(c, env_file=env_file)
     units = ["flightlink-api.service", "flightlink-agent.service", "flightlink-archive.service"]
     if c.settings.adapter_mode == "fake":
-        c.db.record_component_heartbeat("flightlink-api", "ok", "Started by flightlink run")
+        c.db.record_component_heartbeat("flightlink-api", "ok", f"Started by flightlink run ({resolved_host}:{resolved_port})")
         c.db.record_component_heartbeat("flightlink-agent", "ok", "Started by flightlink run")
         c.db.record_component_heartbeat("flightlink-archive", "ok", "Started by flightlink run")
-        _echo_json({"status": "started", "services": units, "aircraft_channels_auto_started": False})
+        _echo_json(
+            {
+                "status": "started",
+                "services": units,
+                "api_listen": f"{resolved_host}:{resolved_port}",
+                "env_updated": env_updated,
+                "aircraft_channels_auto_started": False,
+            }
+        )
         return
     subprocess.run(["systemctl", "enable", "--now", *units], check=True)
-    _echo_json({"status": "started", "services": units, "aircraft_channels_auto_started": False})
+    if env_updated:
+        subprocess.run(["systemctl", "restart", "flightlink-api.service"], check=True)
+    _echo_json(
+        {
+            "status": "started",
+            "services": units,
+            "api_listen": f"{resolved_host}:{resolved_port}",
+            "env_updated": env_updated,
+            "aircraft_channels_auto_started": False,
+        }
+    )
+
+
+@cli.command("clear", help="Clean legacy v0.1 remnants (default), orphaned 1.0 runtime files (--runtime), or full 1.0 reset (--all --yes).")
+@click.option("--legacy", "mode_legacy", is_flag=True, default=False, help="Clean legacy v0.1 remnants only (default, safe for 1.0).")
+@click.option("--runtime", "mode_runtime", is_flag=True, default=False, help="Clean orphaned FlightLink 1.0 runtime configs/env/units.")
+@click.option("--all", "mode_all", is_flag=True, default=False, help="Full reset of FlightLink 1.0 host state (requires --yes; preserves archives by default).")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview actions without stopping services or deleting files.")
+@click.option("--include-legacy-app", is_flag=True, default=False, help="Also remove legacy /etc/flightlink/api.env and /opt/flightlink/backend.")
+@click.option("--skip-cloud", is_flag=True, default=False, help="In --all mode, skip revoking FlightLink-owned cloud security group rules.")
+@click.option("--purge-archives", is_flag=True, default=False, help="In --all mode, also delete archived flight logs (default: preserved).")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Confirm destructive --all cleanup.")
+@click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
+@click.option("--systemd-dir", type=click.Path(path_type=Path), default=SYSTEMD_DIR, hidden=True)
+@click.option("--polkit-rule", type=click.Path(path_type=Path), default=POLKIT_RULE_PATH, hidden=True)
+@click.option("--root-prefix", type=click.Path(path_type=Path), default=None, hidden=True)
+@click.pass_obj
+def cmd_clear(
+    c: CliContext,
+    mode_legacy: bool,
+    mode_runtime: bool,
+    mode_all: bool,
+    dry_run: bool,
+    include_legacy_app: bool,
+    skip_cloud: bool,
+    purge_archives: bool,
+    yes: bool,
+    env_file: Path,
+    systemd_dir: Path,
+    polkit_rule: Path,
+    root_prefix: Path | None,
+) -> None:
+    selected = [m for m, flag in (("legacy", mode_legacy), ("runtime", mode_runtime), ("all", mode_all)) if flag]
+    if len(selected) > 1:
+        raise click.ClickException("Choose at most one mode: --legacy, --runtime, or --all.")
+    mode: Literal["legacy", "runtime", "all"] = selected[0] if selected else "legacy"  # type: ignore[assignment]
+
+    if mode == "all" and not dry_run and not yes:
+        raise click.ClickException(
+            "Refusing destructive `--all` cleanup without `--yes` (run with `--dry-run` first to preview)."
+        )
+    if purge_archives and mode != "all":
+        raise click.ClickException("--purge-archives can only be used together with --all --yes.")
+
+    active_ids: set[str] = set()
+    ecs_id = c.settings.ecs_instance_id
+    sg_id = c.settings.aliyun_security_group_id
+    if c.settings.resolved_db_path.exists():
+        try:
+            active_ids = {g.group_id for g in c.repo.list_groups().items}
+            ecs_id = c.db.get_meta("ecs_instance_id") or ecs_id
+            sg_id = c.db.get_meta("aliyun_security_group_id") or sg_id
+        except Exception:
+            pass
+
+    if mode == "all" and not dry_run and c.settings.adapter_mode == "fake":
+        for gid in active_ids:
+            c.agent.supervisor.stop_mavproxy(gid)
+            c.agent.supervisor.stop_router(gid)
+
+    result = clear_environment(
+        mode=mode,
+        dry_run=dry_run,
+        include_legacy_app=include_legacy_app,
+        skip_cloud=skip_cloud,
+        purge_archives=purge_archives,
+        data_dir=c.settings.data_dir,
+        active_group_ids=active_ids,
+        ecs_instance_id=ecs_id,
+        sg_id=sg_id,
+        sg_client=c.agent.sg_client,
+        env_file=env_file,
+        systemd_dir=systemd_dir,
+        polkit_rule_path=polkit_rule,
+        root_prefix=root_prefix,
+        apply_os_commands=c.settings.adapter_mode != "fake" and is_linux_root(),
+    )
+    _echo_json(result)
 
 
 @cli.command("stop", help="Stop active channels and management services; NEVER deletes archives.")

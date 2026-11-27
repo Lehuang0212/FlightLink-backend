@@ -91,7 +91,8 @@ fi
 
 echo ""
 echo "FlightLink installed successfully! Next steps:"
-echo "  1. sudo flightlink init --admin-user ops_admin --admin-password '<强密码>' --dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0"
+echo "  0. (Optional, if upgrading from v0.1) sudo flightlink clear --dry-run && sudo flightlink clear"
+echo "  1. sudo flightlink init --admin-user ops_admin --admin-password '<强密码>' --dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0 [--port 8000]"
 echo "  2. sudo flightlink connect --ram --region cn-beijing --security-group <业务安全组ID> [--ram-role <角色名>]"
 echo "  3. sudo flightlink doctor"
-echo "  4. sudo flightlink run"
+echo "  4. sudo flightlink run [--port 8000]"

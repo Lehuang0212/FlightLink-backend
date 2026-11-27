@@ -505,6 +505,12 @@ class ControlPlaneRepository:
                 details=[ErrorDetailItem(field="gcs_port", message="gcs_port cannot equal dtu_port")],
             )
         for field_name, port in (("dtu_port", dtu_port), ("gcs_port", gcs_port)):
+            if port == self.settings.api_port:
+                raise ConflictError(
+                    "PORT_CONFLICT",
+                    f"Port {port} is reserved for the FlightLink management API (api_port).",
+                    details=[ErrorDetailItem(field=field_name, message=f"Port {port} conflicts with API port")],
+                )
             row = conn.execute(
                 """
                 SELECT pr.group_id, pg.name, pr.reservation_kind

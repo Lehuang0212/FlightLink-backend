@@ -38,24 +38,34 @@ python3 -m venv /opt/flightlink/venv
 
 ### 2.3 一键安装与 CLI 初始化（自动配置用户 / systemd / Polkit / SELinux / `flightlink.env`）
 ```bash
-# 1. 安装虚拟环境与 /usr/local/bin/flightlink（不修改全局系统源）
+# 1. 安装虚拟环境与 /usr/local/bin/flightlink（纯安装，不修改全局系统源）
 sudo bash scripts/install.sh --mirror aliyun        # 或 --mirror tsinghua / --offline-dir <目录>
 
-# 2. 一键初始化主机环境（自动创建隔离用户、目录、flightlink.env、systemd 单元、Polkit、SELinux 与正式管理员）
+# 1.5 （可选，如主机曾装过旧版 v0.1）先预览再一键清理旧版残留（不影响 1.0 数据）
+sudo flightlink clear --dry-run
+sudo flightlink clear
+
+# 2. 一键初始化主机环境（--port 默认 8000，可按需指定如 --port 18080）
 sudo flightlink init \
   --admin-user ops_admin --admin-password '<强密码>' \
-  --dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0
+  --dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0 \
+  --port 8000
 
 # 3. 验证并记录 ECS 实例 RAM 角色和目标业务安全组（不传 --ram-role 则自动发现当前挂载角色，传入则严格核对）
 sudo flightlink connect --ram \
   --region cn-beijing --security-group <专用业务安全组ID> [--ram-role <角色名>]
 
-# 4. 只读自检 & 启动三个管理服务（不批量拉起飞机端口组）
+# 4. 只读自检 & 启动三个管理服务（支持启动时通过 --port 覆盖端口，不批量拉起飞机端口组）
 sudo flightlink doctor
-sudo flightlink run
+sudo flightlink run [--port 18080]
 ```
 
-> **管理入口安全**：`flightlink-api` 默认仅监听 `127.0.0.1:8000`；远程访问必须经由 Nginx / Caddy TLS 反向代理提供 HTTPS，且管理入口安全组与业务端口安全组独立。
+> **管理入口安全**：`flightlink-api` 默认仅监听 `127.0.0.1:8000`（可通过 `flightlink init --port <PORT>` 或 `flightlink run --port <PORT>` 自定义端口）；远程访问必须经由 Nginx / Caddy TLS 反向代理提供 HTTPS，且管理入口安全组与业务端口安全组独立。
+>
+> **环境清理命令 `flightlink clear`**：
+> - `sudo flightlink clear`（默认 `--legacy`）：仅按白名单清理旧版 v0.1 残留（`flightlink-capture@.service`、`flightlink-api.service.d`、`flightlink-routerctl`、`flightlink-capture-runner`、旧 sudoers 等），绝不触碰 1.0 数据与归档；
+> - `sudo flightlink clear --runtime`：清理 1.0 孤立 `.candidate.conf` / 孤立 `mavproxy-*.env` / 脱管 router 单元；
+> - `sudo flightlink clear --all --yes`：完整重置 1.0 宿主机状态（停服务、回收本机归属阿里云安全组规则并保护人工规则、清理 unit/env/DB；默认保留 `/var/lib/flightlink/archive`，仅额外指定 `--purge-archives` 时删除归档）；所有模式均支持 `--dry-run` 预览。
 
 ---
 

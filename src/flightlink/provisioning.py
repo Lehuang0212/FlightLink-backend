@@ -217,8 +217,8 @@ def provision_linux_host(
     env_file: Path = DEFAULT_ENV_PATH,
     systemd_dir: Path = SYSTEMD_DIR,
     polkit_rule_path: Path = POLKIT_RULE_PATH,
-    api_host: str = "127.0.0.1",
-    api_port: int = 8000,
+    api_host: str | None = None,
+    api_port: int | None = None,
     dtu_cidrs: list[str] | None = None,
     gcs_cidrs: list[str] | None = None,
     apply_os_commands: bool = True,
@@ -249,10 +249,12 @@ def provision_linux_host(
 
     existing_env = parse_env_file(env_file)
     jwt_secret = existing_env.get("FLIGHTLINK_JWT_SECRET") or secrets.token_hex(32)
+    resolved_api_host = api_host if api_host is not None else existing_env.get("FLIGHTLINK_API_HOST", "127.0.0.1")
+    resolved_api_port = str(api_port) if api_port is not None else existing_env.get("FLIGHTLINK_API_PORT", "8000")
     env_updates: dict[str, str] = {
         "FLIGHTLINK_DATA_DIR": str(data_dir),
-        "FLIGHTLINK_API_HOST": existing_env.get("FLIGHTLINK_API_HOST", api_host),
-        "FLIGHTLINK_API_PORT": existing_env.get("FLIGHTLINK_API_PORT", str(api_port)),
+        "FLIGHTLINK_API_HOST": resolved_api_host,
+        "FLIGHTLINK_API_PORT": resolved_api_port,
         "FLIGHTLINK_JWT_SECRET": jwt_secret,
         "FLIGHTLINK_ADAPTER_MODE": existing_env.get("FLIGHTLINK_ADAPTER_MODE", "linux"),
     }
@@ -301,6 +303,7 @@ def provision_linux_host(
         "env_file": str(env_file),
         "systemd_dir": str(systemd_dir),
         "polkit_rule": str(polkit_rule_path),
+        "api_listen": f"{resolved_api_host}:{resolved_api_port}",
         "mavlink_routerd": routerd_bin,
         "mavproxy": mavproxy_bin,
         "actions": actions,
