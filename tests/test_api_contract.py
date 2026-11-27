@@ -329,3 +329,63 @@ def test_periodic_reconcile_keeps_fresh_preserves_connected_mavproxy_and_detects
         clock.advance(seconds=350)
         det_all_stale = client.get(f"/api/v1/groups/{gid_running}", headers=admin_h).json()
         assert det_all_stale["security_group"]["stale"] is True
+
+
+def test_archive_groups_list_includes_deleted_empty_and_recreated_groups(tmp_path: Path) -> None:
+    """QA-02: deleted groups with 0 sessions MUST stay visible in `GET /archive/groups?include_deleted=true`,
+    matching `GET /archive/groups/{group_id}`, and remain independent after same-name/same-port recreation.
+    """
+    app, login, agent, _archive, _fake, _clock = _setup(tmp_path)
+    with TestClient(app) as client:
+        admin_h = login(client, "ops_admin", "AdminPassword!1")
+
+        # 1. Create a port group with 0 FC sessions, then delete it
+        body = {"name": "QA-1ef75364", "dtu_port": 5760, "gcs_protocol": "tcp", "gcs_port": 14552}
+        r_create = client.post("/api/v1/groups", headers=admin_h, json=body)
+        assert r_create.status_code == 202
+        old_gid = r_create.json()["operation"]["group_id"]
+        agent.process_pending_operations()
+
+        r_del = client.delete(f"/api/v1/groups/{old_gid}", headers=admin_h)
+        assert r_del.status_code == 202
+        agent.process_pending_operations()
+
+        # 2. List with include_deleted=true MUST include the deleted empty group, matching detail exactly
+        r_detail = client.get(f"/api/v1/archive/groups/{old_gid}", headers=admin_h)
+        assert r_detail.status_code == 200
+        detail = r_detail.json()
+        assert detail["deleted"] is True
+        assert detail["deleted_at"] is not None
+        assert detail["active_session_count"] == 0
+        assert detail["sealed_session_count"] == 0
+        assert detail["latest_session"] is None
+
+        r_list_all = client.get("/api/v1/archive/groups?include_deleted=true", headers=admin_h)
+        assert r_list_all.status_code == 200
+        by_id = {item["group_id"]: item for item in r_list_all.json()["items"]}
+        assert old_gid in by_id
+        assert by_id[old_gid] == detail
+
+        # 3. List with include_deleted=false MUST exclude the deleted group
+        r_list_active = client.get("/api/v1/archive/groups?include_deleted=false", headers=admin_h)
+        assert r_list_active.status_code == 200
+        assert all(item["group_id"] != old_gid for item in r_list_active.json()["items"])
+
+        # 4. Recreate with identical name and ports -> both old (deleted=true) and new (deleted=false)
+        #    MUST coexist independently in `GET /archive/groups?include_deleted=true`
+        r_recreate = client.post("/api/v1/groups", headers=admin_h, json=body)
+        assert r_recreate.status_code == 202
+        new_gid = r_recreate.json()["operation"]["group_id"]
+        assert new_gid != old_gid
+        agent.process_pending_operations()
+
+        r_list_both = client.get("/api/v1/archive/groups?include_deleted=true", headers=admin_h)
+        assert r_list_both.status_code == 200
+        both = {item["group_id"]: item for item in r_list_both.json()["items"]}
+        assert old_gid in both and new_gid in both
+        assert both[old_gid]["deleted"] is True
+        assert both[old_gid]["name_snapshot"] == "QA-1ef75364"
+        assert both[new_gid]["deleted"] is False
+        assert both[new_gid]["name_snapshot"] == "QA-1ef75364"
+        assert both[new_gid]["dtu_port_snapshot"] == 5760
+        assert both[new_gid]["gcs_port_snapshot"] == 14552

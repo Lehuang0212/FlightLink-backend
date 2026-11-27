@@ -807,6 +807,49 @@ class ArchiveService:
                 return True
         return False
 
+    def _build_archive_group_summary(
+        self,
+        conn: sqlite3.Connection,
+        g: sqlite3.Row,
+        *,
+        ecs_instance_id: str,
+    ) -> ArchiveGroupSummary:
+        gid = str(g["group_id"])
+        sess_rows = conn.execute(
+            """
+            SELECT * FROM archive_sessions
+            WHERE group_id = ? AND purged_at IS NULL
+            ORDER BY first_observed_at DESC, session_id DESC
+            """,
+            (gid,),
+        ).fetchall()
+        live_sessions = [s for s in sess_rows if not self._is_session_expired(s)]
+        active_cnt = sum(1 for s in live_sessions if s["status"] != "sealed")
+        sealed_cnt = sum(1 for s in live_sessions if s["status"] == "sealed")
+        latest = (
+            self._build_session_summary(
+                conn,
+                live_sessions[0],
+                ecs_instance_id=ecs_instance_id,
+                group_deleted=bool(g["deleted"]),
+            )
+            if live_sessions
+            else None
+        )
+        return ArchiveGroupSummary(
+            group_id=gid,
+            name_snapshot=str(g["name_snapshot"]),
+            dtu_protocol="udp",
+            dtu_port_snapshot=int(g["dtu_port_snapshot"]),
+            gcs_protocol_snapshot=g["gcs_protocol_snapshot"],
+            gcs_port_snapshot=int(g["gcs_port_snapshot"]),
+            deleted=bool(g["deleted"]),
+            deleted_at=g["deleted_at"],
+            active_session_count=active_cnt,
+            sealed_session_count=sealed_cnt,
+            latest_session=latest,
+        )
+
     def list_archive_groups(self, *, include_deleted: bool = True) -> ArchiveGroupListResponse:
         ecs_instance_id = self.db.get_meta("ecs_instance_id", "ecs_unknown") or "ecs_unknown"
         now_iso = self.clock.now_iso()
@@ -815,48 +858,15 @@ class ArchiveService:
         with self.db.read() as conn:
             where = "" if include_deleted else "WHERE deleted = 0"
             groups = conn.execute(
-                f"SELECT * FROM archive_groups {where} ORDER BY created_at ASC"
+                f"SELECT * FROM archive_groups {where} ORDER BY created_at ASC, group_id ASC"
             ).fetchall()
 
             for g in groups:
-                gid = str(g["group_id"])
-                sess_rows = conn.execute(
-                    """
-                    SELECT * FROM archive_sessions
-                    WHERE group_id = ? AND purged_at IS NULL
-                    ORDER BY first_observed_at DESC
-                    """,
-                    (gid,),
-                ).fetchall()
-                live_sessions = [s for s in sess_rows if not self._is_session_expired(s)]
-                active_cnt = sum(1 for s in live_sessions if s["status"] != "sealed")
-                sealed_cnt = sum(1 for s in live_sessions if s["status"] == "sealed")
-                # Deleted groups with zero retained sessions are omitted from list
-                if bool(g["deleted"]) and active_cnt == 0 and sealed_cnt == 0:
-                    continue
-                latest = (
-                    self._build_session_summary(
-                        conn,
-                        live_sessions[0],
-                        ecs_instance_id=ecs_instance_id,
-                        group_deleted=bool(g["deleted"]),
-                    )
-                    if live_sessions
-                    else None
-                )
                 items.append(
-                    ArchiveGroupSummary(
-                        group_id=gid,
-                        name_snapshot=str(g["name_snapshot"]),
-                        dtu_protocol="udp",
-                        dtu_port_snapshot=int(g["dtu_port_snapshot"]),
-                        gcs_protocol_snapshot=g["gcs_protocol_snapshot"],
-                        gcs_port_snapshot=int(g["gcs_port_snapshot"]),
-                        deleted=bool(g["deleted"]),
-                        deleted_at=g["deleted_at"],
-                        active_session_count=active_cnt,
-                        sealed_session_count=sealed_cnt,
-                        latest_session=latest,
+                    self._build_archive_group_summary(
+                        conn,
+                        g,
+                        ecs_instance_id=ecs_instance_id,
                     )
                 )
 
@@ -878,39 +888,10 @@ class ArchiveService:
                     "ARCHIVE_GROUP_NOT_FOUND",
                     f"Archive group '{group_id}' not found.",
                 )
-            sess_rows = conn.execute(
-                """
-                SELECT * FROM archive_sessions
-                WHERE group_id = ? AND purged_at IS NULL
-                ORDER BY first_observed_at DESC
-                """,
-                (group_id,),
-            ).fetchall()
-            live_sessions = [s for s in sess_rows if not self._is_session_expired(s)]
-            active_cnt = sum(1 for s in live_sessions if s["status"] != "sealed")
-            sealed_cnt = sum(1 for s in live_sessions if s["status"] == "sealed")
-            latest = (
-                self._build_session_summary(
-                    conn,
-                    live_sessions[0],
-                    ecs_instance_id=ecs_instance_id,
-                    group_deleted=bool(g["deleted"]),
-                )
-                if live_sessions
-                else None
-            )
-            return ArchiveGroupSummary(
-                group_id=group_id,
-                name_snapshot=str(g["name_snapshot"]),
-                dtu_protocol="udp",
-                dtu_port_snapshot=int(g["dtu_port_snapshot"]),
-                gcs_protocol_snapshot=g["gcs_protocol_snapshot"],
-                gcs_port_snapshot=int(g["gcs_port_snapshot"]),
-                deleted=bool(g["deleted"]),
-                deleted_at=g["deleted_at"],
-                active_session_count=active_cnt,
-                sealed_session_count=sealed_cnt,
-                latest_session=latest,
+            return self._build_archive_group_summary(
+                conn,
+                g,
+                ecs_instance_id=ecs_instance_id,
             )
 
     def list_group_sessions(
