@@ -1134,11 +1134,33 @@ class ControlPlaneRepository:
                         "GROUP_BUSY",
                         f"Port group already has active operation '{busy['operation_id']}'.",
                     )
+                conn.execute(
+                    """
+                    UPDATE port_groups
+                    SET operation_generation = ?, updated_at = ?
+                    WHERE group_id = ?
+                    """,
+                    (new_gen, now_iso, group_id),
+                )
                 steps = [
                     ("reconcile_security_group", "pending"),
                     ("verify_security_group", "pending"),
                 ]
             else:  # verify
+                busy = self._has_active_operation(conn, group_id)
+                if busy is not None:
+                    raise ConflictError(
+                        "GROUP_BUSY",
+                        f"Port group already has active operation '{busy['operation_id']}'.",
+                    )
+                conn.execute(
+                    """
+                    UPDATE port_groups
+                    SET operation_generation = ?, updated_at = ?
+                    WHERE group_id = ?
+                    """,
+                    (new_gen, now_iso, group_id),
+                )
                 steps = [
                     ("inspect_actual_runtime", "pending"),
                     ("reconcile_state", "pending"),
@@ -1213,6 +1235,14 @@ class ControlPlaneRepository:
                         "Cannot retry non-delete operation on a deleting/cleanup_pending group.",
                     )
 
+            if action != "delete":
+                busy = self._has_active_operation(conn, group_id)
+                if busy is not None:
+                    raise ConflictError(
+                        "GROUP_BUSY",
+                        f"Port group already has active operation '{busy['operation_id']}'.",
+                    )
+
             now_iso = self.clock.now_iso()
             new_gen = int(group["operation_generation"]) + 1
             conn.execute(
@@ -1251,14 +1281,15 @@ class ControlPlaneRepository:
     # ------------------------------------------------------------------
     # Strictly Read-Only Queries (ZERO side effects!)
     # ------------------------------------------------------------------
-    def _is_stale(self, observed_at: str | None) -> bool:
+    def _is_stale(self, observed_at: str | None, *, max_age_seconds: float | None = None) -> bool:
         if not observed_at:
             return True
         dt = parse_rfc3339(observed_at)
         if dt is None:
             return True
+        threshold = self.settings.stale_after_seconds if max_age_seconds is None else max_age_seconds
         age = (self.clock.now() - dt).total_seconds()
-        return age > self.settings.stale_after_seconds
+        return age > threshold
 
     def _build_group_summary(self, conn: sqlite3.Connection, row: sqlite3.Row) -> GroupSummary:
         group_id = str(row["group_id"])
@@ -1335,7 +1366,15 @@ class ControlPlaneRepository:
                 owned_rule_count=sum(1 for r in rules if r.status == "present"),
                 rules=rules,
                 observed_at=sg_obs,
-                stale=self._is_stale(sg_obs) if sg_obs else False,
+                stale=(
+                    False
+                    if (rt["sg_state"] if rt else "unconfigured") == "unconfigured"
+                    else (
+                        self._is_stale(sg_obs, max_age_seconds=self.settings.sg_stale_after_seconds)
+                        if sg_obs
+                        else False
+                    )
+                ),
                 detail=rt["sg_detail"] if rt else None,
             ),
             observed_at=observed_at,

@@ -59,6 +59,8 @@ class LifecycleAgent:
         self.clock = clock or db.clock or SystemClock()
         self._group_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._last_runtime_reconcile_at: float | None = None
+        self._last_sg_reconcile_at: float | None = None
 
     def _lock_for(self, group_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -531,8 +533,8 @@ class LifecycleAgent:
                     )
                     return
 
-                # Fence stale non-delete operations!
-                if action != "delete" and (
+                # Fence stale operations! (`verify` is explicitly allowed on deleting/cleanup_pending groups)
+                if action not in ("delete", "verify") and (
                     group["desired_state"] == "deleting"
                     or int(group["operation_generation"]) != op_gen
                 ):
@@ -541,9 +543,9 @@ class LifecycleAgent:
                         (now_iso, now_iso, operation_id),
                     )
                     return
-                if action == "delete" and int(group["operation_generation"]) != op_gen:
+                if action in ("delete", "verify") and int(group["operation_generation"]) != op_gen:
                     conn.execute(
-                        "UPDATE operations SET status = 'cancelled', finished_at = ?, updated_at = ?, error_code = 'STALE_GENERATION' WHERE operation_id = ?",
+                        "UPDATE operations SET status = 'cancelled', finished_at = ?, updated_at = ?, error_code = 'STALE_GENERATION', error_message = 'Superseded by newer operation generation.' WHERE operation_id = ?",
                         (now_iso, now_iso, operation_id),
                     )
                     return
@@ -643,8 +645,8 @@ class LifecycleAgent:
                 (now_iso, group_id),
             )
             conn.execute(
-                "UPDATE group_runtime_status SET router_state = 'stopped', router_observed_at = ?, observed_at = ? WHERE group_id = ?",
-                (now_iso, now_iso, group_id),
+                "UPDATE group_runtime_status SET router_state = 'stopped', router_observed_at = ?, mavproxy_state = 'disconnected', mavproxy_observed_at = ?, observed_at = ? WHERE group_id = ?",
+                (now_iso, now_iso, now_iso, group_id),
             )
         self._finish_operation(op_id, "succeeded")
 
@@ -1421,13 +1423,194 @@ class LifecycleAgent:
             self.supervisor.stop_mavproxy(orphan_gid)
             self.supervisor.stop_router(orphan_gid)
 
+        self._last_runtime_reconcile_at = self.clock.now().timestamp()
+        self.reconcile_security_groups_readonly()
         self.db.record_component_heartbeat("flightlink-agent", "ok", "Startup reconciliation complete")
         return report
+
+    def _has_active_operation_for_group(self, group_id: str) -> bool:
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM operations WHERE group_id = ? AND status IN ('pending', 'running') LIMIT 1",
+                (group_id,),
+            ).fetchone()
+        return row is not None
+
+    def reconcile_periodic_runtime(self) -> list[str]:
+        """Refresh local router/MAVProxy/socket observations for all idle non-deleted groups."""
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT group_id FROM port_groups WHERE deleted_at IS NULL"
+            ).fetchall()
+
+        reconciled: list[str] = []
+        for r in rows:
+            gid = str(r["group_id"])
+            lock = self._lock_for(gid)
+            if not lock.acquire(blocking=False):
+                continue
+            try:
+                if self._has_active_operation_for_group(gid):
+                    continue
+                self.reconcile_group_runtime(gid, ecs_reboot=False)
+                reconciled.append(gid)
+            finally:
+                lock.release()
+
+        self._last_runtime_reconcile_at = self.clock.now().timestamp()
+        return reconciled
+
+    def reconcile_security_groups_readonly(self) -> dict[str, str]:
+        """Read-only periodic check of cloud SG rules (single cloud list call for all groups).
+
+        NEVER starts, stops, or restarts any Router/MAVProxy channel on temporary cloud/RAM errors.
+        """
+        sg_id, _, _ = self._sg_config()
+        now_iso = self.clock.now_iso()
+        with self.db.read() as conn:
+            groups = conn.execute(
+                """
+                SELECT group_id, dtu_port, gcs_protocol, gcs_port
+                FROM port_groups
+                WHERE deleted_at IS NULL AND desired_state != 'deleting'
+                """
+            ).fetchall()
+
+        results: dict[str, str] = {}
+        if not sg_id:
+            for g in groups:
+                gid = str(g["group_id"])
+                lock = self._lock_for(gid)
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
+                    if self._has_active_operation_for_group(gid):
+                        continue
+                    with self.db.write_transaction() as conn:
+                        conn.execute(
+                            """
+                            UPDATE group_runtime_status
+                            SET sg_state = 'unconfigured', sg_id = NULL, sg_observed_at = ?, sg_detail = ?
+                            WHERE group_id = ?
+                            """,
+                            (now_iso, "No security group bound", gid),
+                        )
+                    results[gid] = "unconfigured"
+                finally:
+                    lock.release()
+            self._last_sg_reconcile_at = self.clock.now().timestamp()
+            return results
+
+        try:
+            live_rules = self.sg_client.list_rules(security_group_id=sg_id)
+        except Exception as exc:
+            # Temporary RAM/network error: NEVER touch healthy channels or falsify sg_observed_at!
+            for g in groups:
+                gid = str(g["group_id"])
+                lock = self._lock_for(gid)
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
+                    if self._has_active_operation_for_group(gid):
+                        continue
+                    with self.db.write_transaction() as conn:
+                        conn.execute(
+                            "UPDATE group_runtime_status SET sg_detail = ? WHERE group_id = ?",
+                            (f"Read-only SG poll failed (channels unaffected): {exc}", gid),
+                        )
+                finally:
+                    lock.release()
+            self._last_sg_reconcile_at = self.clock.now().timestamp()
+            return results
+
+        ecs_id = self._ecs_instance_id()
+        for g in groups:
+            gid = str(g["group_id"])
+            lock = self._lock_for(gid)
+            if not lock.acquire(blocking=False):
+                continue
+            try:
+                if self._has_active_operation_for_group(gid):
+                    continue
+                specs = self._desired_sg_specs(
+                    group_id=gid,
+                    dtu_port=int(g["dtu_port"]),
+                    gcs_protocol=g["gcs_protocol"],
+                    gcs_port=int(g["gcs_port"]),
+                )
+                if not specs:
+                    new_state = "needs_verification"
+                    detail: str | None = "Explicit DTU/GCS source CIDRs are not configured"
+                else:
+                    prefix = f"flightlink:v1:{ecs_id}:{gid}:"
+                    expected_keys = {
+                        (s["ownership_marker"], s["protocol"], s["port"], s["source_cidr"])
+                        for s in specs
+                    }
+                    live_keys = {
+                        (lr.description, lr.protocol, lr.port, lr.source_cidr)
+                        for lr in live_rules
+                        if lr.description.startswith(prefix)
+                    }
+                    missing = expected_keys - live_keys
+                    extra = live_keys - expected_keys
+                    if not missing and not extra:
+                        new_state = "synced"
+                        detail = None
+                    else:
+                        new_state = "drift"
+                        detail = f"Cloud SG drift detected: missing={len(missing)}, extra={len(extra)}"
+
+                with self.db.write_transaction() as conn:
+                    conn.execute(
+                        """
+                        UPDATE group_runtime_status
+                        SET sg_state = ?, sg_id = ?, sg_observed_at = ?, sg_detail = ?
+                        WHERE group_id = ?
+                        """,
+                        (new_state, sg_id, now_iso, detail, gid),
+                    )
+                results[gid] = new_state
+            finally:
+                lock.release()
+
+        self._last_sg_reconcile_at = self.clock.now().timestamp()
+        return results
+
+    def run_periodic_reconcile_if_due(
+        self,
+        *,
+        force_runtime: bool = False,
+        force_sg: bool = False,
+    ) -> dict[str, Any]:
+        """Run local runtime and cloud SG periodic reconciliations whenever their intervals elapse."""
+        now_ts = self.clock.now().timestamp()
+        out: dict[str, Any] = {"runtime_reconciled": [], "sg_reconciled": {}}
+
+        if (
+            force_runtime
+            or self._last_runtime_reconcile_at is None
+            or (now_ts - self._last_runtime_reconcile_at) >= self.settings.runtime_reconcile_interval_seconds
+        ):
+            out["runtime_reconciled"] = self.reconcile_periodic_runtime()
+
+        if (
+            force_sg
+            or self._last_sg_reconcile_at is None
+            or (now_ts - self._last_sg_reconcile_at) >= self.settings.sg_reconcile_interval_seconds
+        ):
+            out["sg_reconciled"] = self.reconcile_security_groups_readonly()
+
+        return out
 
     def reconcile_group_runtime(self, group_id: str, *, ecs_reboot: bool = False) -> str:
         with self.db.read() as conn:
             g = conn.execute(
                 "SELECT * FROM port_groups WHERE group_id = ? AND deleted_at IS NULL",
+                (group_id,),
+            ).fetchone()
+            rt_row = conn.execute(
+                "SELECT mavproxy_state FROM group_runtime_status WHERE group_id = ?",
                 (group_id,),
             ).fetchone()
         if g is None:
@@ -1440,7 +1623,10 @@ class LifecycleAgent:
             ("udp", int(g["dtu_port"])),
             (g["gcs_protocol"], int(g["gcs_port"])),
         ]
-        verified, bound = self.sockets.verify_group_listening(group_id=group_id, endpoints=endpoints)
+        if rt.active:
+            verified, bound = self.sockets.verify_group_listening(group_id=group_id, endpoints=endpoints)
+        else:
+            verified, bound = False, []
 
         # If group is deleting/cleanup_pending, make sure processes stay stopped (NEVER resurrect!)
         if g["desired_state"] == "deleting" or g["lifecycle_state"] in ("deleting", "cleanup_pending"):
@@ -1452,10 +1638,11 @@ class LifecycleAgent:
                     """
                     UPDATE group_runtime_status
                     SET router_state = 'stopped', router_pid = NULL, router_verified_listening = 0,
-                        router_observed_at = ?, observed_at = ?
+                        router_observed_at = ?, mavproxy_state = 'disconnected', mavproxy_pid = NULL,
+                        mavproxy_observed_at = ?, observed_at = ?
                     WHERE group_id = ?
                     """,
-                    (now_iso, now_iso, group_id),
+                    (now_iso, now_iso, now_iso, group_id),
                 )
             return "cleanup_pending"
 
@@ -1480,15 +1667,28 @@ class LifecycleAgent:
             new_lifecycle = "needs_verification"
             ver_reason = "Router is listening despite desired_state=stopped"
 
+        # Preserve `mavproxy_state='connected'` when MAVProxy is active (never clobber back to 'waiting'!)
+        prev_mav_state = str(rt_row["mavproxy_state"]) if (rt_row and rt_row["mavproxy_state"]) else "disconnected"
+        if mav.active:
+            new_mav_state = "connected" if prev_mav_state == "connected" else "waiting"
+        else:
+            new_mav_state = "disconnected"
+
+        group_changed = (
+            new_desired != str(g["desired_state"])
+            or new_lifecycle != str(g["lifecycle_state"])
+            or ver_reason != g["verification_reason"]
+        )
         with self.db.write_transaction() as conn:
-            conn.execute(
-                """
-                UPDATE port_groups
-                SET desired_state = ?, lifecycle_state = ?, verification_reason = ?, updated_at = ?
-                WHERE group_id = ?
-                """,
-                (new_desired, new_lifecycle, ver_reason, now_iso, group_id),
-            )
+            if group_changed:
+                conn.execute(
+                    """
+                    UPDATE port_groups
+                    SET desired_state = ?, lifecycle_state = ?, verification_reason = ?, updated_at = ?
+                    WHERE group_id = ?
+                    """,
+                    (new_desired, new_lifecycle, ver_reason, now_iso, group_id),
+                )
             conn.execute(
                 """
                 UPDATE group_runtime_status
@@ -1507,7 +1707,7 @@ class LifecycleAgent:
                     json.dumps(bound),
                     1 if (rt.active and verified) else 0,
                     now_iso,
-                    "waiting" if mav.active else "disconnected",
+                    new_mav_state,
                     mav.pid,
                     now_iso,
                     now_iso,

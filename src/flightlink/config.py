@@ -52,6 +52,9 @@ class Settings(BaseSettings):
 
     max_groups: int = 5
     stale_after_seconds: int = 30
+    runtime_reconcile_interval_seconds: float = 10.0
+    sg_reconcile_interval_seconds: float = 120.0
+    sg_stale_after_seconds: int = 360
     fc_heartbeat_grace_seconds: int = 15
     archive_retention_seconds: int = 7 * 24 * 3600
     live_log_buffer_max_rows: int = 20000

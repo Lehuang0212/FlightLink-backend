@@ -61,6 +61,7 @@ def main() -> None:
 
     while not stop:
         agent.process_pending_operations()
+        agent.run_periodic_reconcile_if_due()
         time.sleep(0.5)
 
 
