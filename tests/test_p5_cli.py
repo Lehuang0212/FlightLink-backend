@@ -293,6 +293,21 @@ def test_cli_custom_api_port_and_conflict_guard(tmp_path: Path) -> None:
     assert r_doc.exit_code == 0, r_doc.output
     assert json.loads(r_doc.output)["api_listen"] == "127.0.0.1:19090"
 
+    # 6. `run --port` on an uninitialized/cleared linux host gives a clean Error (no traceback, no half-baked env)
+    uninit_env = tmp_path / "uninit" / "flightlink.env"
+    uninit_systemd = tmp_path / "uninit" / "systemd"
+    ctx.settings.adapter_mode = "linux"
+    r_uninit = runner.invoke(
+        cli,
+        ["run", "--port", "18080", "--env-file", str(uninit_env), "--systemd-dir", str(uninit_systemd)],
+        obj=ctx,
+    )
+    assert r_uninit.exit_code != 0
+    assert "flightlink init" in r_uninit.output
+    assert "--port 18080" in r_uninit.output
+    assert "Traceback" not in r_uninit.output
+    assert not uninit_env.exists()
+
 
 def test_cli_clear_legacy_runtime_and_all_modes(tmp_path: Path) -> None:
     """Verify `flightlink clear` safely cleans v0.1 remnants (default), 1.0 orphaned runtime files,

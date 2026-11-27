@@ -365,8 +365,28 @@ def cmd_doctor(c: CliContext, env_file: Path, systemd_dir: Path, root_prefix: Pa
 @click.option("--host", "--api-host", "api_host", default=None, help="Override API listen host and persist to flightlink.env.")
 @click.option("--port", "--api-port", "api_port", type=click.IntRange(1, 65535), default=None, help="Override API listen port (default: 8000) and persist to flightlink.env.")
 @click.option("--env-file", type=click.Path(path_type=Path), default=DEFAULT_ENV_PATH, hidden=True)
+@click.option("--systemd-dir", type=click.Path(path_type=Path), default=SYSTEMD_DIR, hidden=True)
 @click.pass_obj
-def cmd_run(c: CliContext, api_host: str | None, api_port: int | None, env_file: Path) -> None:
+def cmd_run(
+    c: CliContext,
+    api_host: str | None,
+    api_port: int | None,
+    env_file: Path,
+    systemd_dir: Path,
+) -> None:
+    units = ["flightlink-api.service", "flightlink-agent.service", "flightlink-archive.service"]
+    if c.settings.adapter_mode != "fake":
+        missing_units = [u for u in units if not (systemd_dir / u).exists()]
+        if missing_units:
+            port_hint = f" --port {api_port}" if api_port is not None else ""
+            host_hint = f" --host {api_host}" if api_host is not None else ""
+            raise click.ClickException(
+                "FlightLink host is not initialized (missing systemd units: "
+                + ", ".join(missing_units)
+                + "). Run `sudo flightlink init --admin-user <user> --admin-password '<password>' "
+                + f"--dtu-cidr 0.0.0.0/0 --gcs-cidr 0.0.0.0/0{host_hint}{port_hint}` first."
+            )
+
     if api_port is not None:
         _ensure_api_port_not_reserved(c, api_port)
 
@@ -387,7 +407,6 @@ def cmd_run(c: CliContext, api_host: str | None, api_port: int | None, env_file:
                 subprocess.run(["chmod", "0640", str(env_file)], check=False)
 
     resolved_host, resolved_port = _resolve_api_listen(c, env_file=env_file)
-    units = ["flightlink-api.service", "flightlink-agent.service", "flightlink-archive.service"]
     if c.settings.adapter_mode == "fake":
         c.db.record_component_heartbeat("flightlink-api", "ok", f"Started by flightlink run ({resolved_host}:{resolved_port})")
         c.db.record_component_heartbeat("flightlink-agent", "ok", "Started by flightlink run")
@@ -402,9 +421,12 @@ def cmd_run(c: CliContext, api_host: str | None, api_port: int | None, env_file:
             }
         )
         return
-    subprocess.run(["systemctl", "enable", "--now", *units], check=True)
-    if env_updated:
-        subprocess.run(["systemctl", "restart", "flightlink-api.service"], check=True)
+    try:
+        subprocess.run(["systemctl", "enable", "--now", *units], check=True)
+        if env_updated:
+            subprocess.run(["systemctl", "restart", "flightlink-api.service"], check=True)
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(f"Failed to start FlightLink systemd services: {exc}") from exc
     _echo_json(
         {
             "status": "started",

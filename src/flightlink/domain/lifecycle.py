@@ -1188,6 +1188,10 @@ class LifecycleAgent:
         self.supervisor.stop_router(group_id)
         remove_router_config(self.settings.resolved_router_config_dir, group_id)
         remove_router_config(self.settings.resolved_router_config_dir, group_id, suffix=".candidate")
+        try:
+            (self.settings.resolved_runtime_dir / f"mavproxy-{group_id}.env").unlink()
+        except FileNotFoundError:
+            pass
         now_iso = self.clock.now_iso()
         with self.db.write_transaction() as conn:
             conn.execute(
