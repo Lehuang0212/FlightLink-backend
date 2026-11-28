@@ -189,3 +189,60 @@ sudo flightlink history export <session_id> --source all
 - **PySide6/QML 本地桌面端交接说明**：[docs/desktop-client-handoff.md](docs/desktop-client-handoff.md)
 - **Python 自动归档同步参考实现**：[docs/examples/python_archive_sync.py](docs/examples/python_archive_sync.py)
 - **验收报告与真机证据**：[docs/acceptance.md](docs/acceptance.md)
+
+---
+
+## 六、停止使用 1.0 与彻底清理卸载
+
+按需要保留的数据范围，分为三档操作：
+
+### 1. 仅停止服务（保留配置、数据库、安全组与历史归档）
+```bash
+sudo flightlink stop
+```
+停止全部运行中的飞机通道和 3 个管理服务；**绝不删除数据库与历史归档**，后续随时执行 `sudo flightlink run` 恢复管理服务。
+
+### 2. 停止并清空 1.0 配置与状态（自动回收本机归属云安全组规则）
+```bash
+# 先预览将停止的服务、删除的文件与将回收的云安全组规则（零改动）
+sudo flightlink clear --all --dry-run
+
+# 停止全部服务、删除 1.0 unit/Polkit/env/DB 并自动回收本机归属阿里云安全组规则
+# 默认保留 /var/lib/flightlink/archive 历史归档，且绝不误删手工安全组规则
+sudo flightlink clear --all --yes
+
+# 如需连同 /var/lib/flightlink/archive 历史归档一并删除，追加 --purge-archives：
+# sudo flightlink clear --all --yes --purge-archives
+```
+> 若不希望操作阿里云安全组，可追加 `--skip-cloud`。此步保留 `/opt/flightlink/venv`，后续随时可重新 `sudo flightlink init` 启用。
+
+### 3. 彻底卸载（连同虚拟环境、CLI、目录与系统账号/组一并清理）
+先执行上面的 `flightlink clear --all --yes`（确保先停服并回收阿里云安全组规则），再移除安装包、软链与 1.0 隔离系统账号/用户组：
+
+```bash
+# 1. 停服、清状态并回收本机云安全组规则（若无需保留历史归档请加 --purge-archives）
+sudo flightlink clear --all --yes --purge-archives
+
+# 2. 删除虚拟环境、数据/配置目录与 CLI 软链
+sudo rm -rf /opt/flightlink /etc/flightlink /var/lib/flightlink \
+  /usr/local/bin/flightlink /usr/bin/flightlink
+
+# 3. 删除 1.0 隔离系统账号与共享用户组
+for u in flightlink-api flightlink-agent flightlink-archive; do
+  id "$u" >/dev/null 2>&1 && sudo userdel "$u"
+done
+getent group flightlink >/dev/null 2>&1 && sudo groupdel flightlink
+sudo systemctl daemon-reload
+
+# 4. （可选）清理 systemd journald 历史日志与本地克隆仓库
+# sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+# rm -rf ~/FlightLink-backend
+```
+
+### 4. 清理后复核
+```bash
+systemctl list-unit-files 'flightlink*' --no-pager
+ps -ef | grep -E 'flightlink|mavlink-router|mavproxy' | grep -v grep || true
+sudo ss -H -l -n -u -t -p | grep -E 'flightlink|mavlink-router|mavproxy' || true
+```
+均无输出即表示本机已清理干净（若曾手工在阿里云安全组放行 `8000` / `18080` 等管理端口，请在阿里云控制台一并手动关闭）。
