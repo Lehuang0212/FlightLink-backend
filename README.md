@@ -1,6 +1,6 @@
 # FlightLink ECS Backend 1.0
 
-面向单台阿里云 ECS 的轻量级无人机 MAVLink 多通道转发、旁路观测、云安全组自动化管理与会话归档后端服务（兼容 **Ubuntu 26.04 LTS** 与 **Rocky Linux 9.x**）。
+FlightLink ECS 1.0 后端：面向“飞控 + 4G DTU + 阿里云 ECS + 地面站”的多机 MAVLink 隔离转发控制面。支持最多 5 组独立 `mavlink-routerd` 通道与旁路 `MAVProxy` 观测、阿里云 RAM 最小权限安全组自动同步、真实可空遥测、双源实时日志，以及 7 天飞控会话归档与桌面端增量自动保存（兼容 **Ubuntu 26.04 LTS** 与 **Rocky Linux 9.x**）。
 
 > 旧版 v0.1 代码已完整归档于 [`old-version-0.1`](../../tree/old-version-0.1) 分支，当前 `main` 分支为正式 **1.0** 版本。
 
